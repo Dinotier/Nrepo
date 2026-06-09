@@ -10,11 +10,13 @@ Preprocesses:
   Text   : 100-word vocabulary, 100-feature BoW matrix per annotation
   Labels : multi-hot (n_cat × max_elem) from group/subgroups fields
 """
-import os
 import csv
+import sys
+import time
 import zipfile
 import numpy as np
 import urllib.request
+import urllib.error
 from pathlib import Path
 from collections import Counter
 
@@ -33,43 +35,77 @@ IMG_SIZE     = 100
 
 # ── Download helpers ──────────────────────────────────────────────────────
 
-def _download(url: str, dest: Path, label: str) -> None:
+def _download(url: str, dest: Path, label: str, retries: int = 4) -> None:
+    """Download url → dest with exponential-backoff retry (2s, 4s, 8s, 16s)."""
     if dest.exists():
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[data] downloading {label}...", flush=True)
-    urllib.request.urlretrieve(url, str(dest))
-    print(f"[data] saved → {dest}")
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[data] downloading {label} (attempt {attempt}/{retries})...",
+                  flush=True)
+            urllib.request.urlretrieve(url, str(dest))
+            print(f"[data] saved → {dest}", flush=True)
+            return
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"[data] download failed: {exc}", file=sys.stderr, flush=True)
+            if attempt < retries:
+                wait = 2 ** attempt
+                print(f"[data] retrying in {wait}s...", flush=True)
+                time.sleep(wait)
+            else:
+                dest.unlink(missing_ok=True)  # remove partial file
+                raise RuntimeError(
+                    f"Failed to download {label} after {retries} attempts: {exc}"
+                ) from exc
 
 
 def load_openmoji(data_dir: str = "data") -> list[dict]:
     """Download metadata + images; return list of record dicts."""
-    root    = Path(data_dir)
+    root     = Path(data_dir)
     root.mkdir(exist_ok=True)
 
     csv_path = root / "openmoji.csv"
     zip_path = root / "openmoji-72x72-black.zip"
     img_dir  = root / "openmoji-72x72-black"
 
-    _download(OPENMOJI_CSV_URL, csv_path, "openmoji.csv")
+    try:
+        _download(OPENMOJI_CSV_URL, csv_path, "openmoji.csv")
+    except RuntimeError as e:
+        print(f"[data] ERROR: {e}", file=sys.stderr)
+        return []
 
     if not img_dir.exists():
-        _download(OPENMOJI_ZIP_URL, zip_path, "openmoji PNG archive")
+        try:
+            _download(OPENMOJI_ZIP_URL, zip_path, "openmoji PNG archive")
+        except RuntimeError as e:
+            print(f"[data] ERROR: {e}", file=sys.stderr)
+            return []
         print("[data] extracting images...", flush=True)
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(root)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(root)
+        except zipfile.BadZipFile as e:
+            print(f"[data] ERROR: corrupt zip file: {e}", file=sys.stderr)
+            zip_path.unlink(missing_ok=True)
+            return []
 
     records: list[dict] = []
-    with open(csv_path, encoding="utf-8", newline="") as f:
-        for row in csv.DictReader(f):
-            hexcode    = row.get("hexcode",    "").strip()
-            annotation = row.get("annotation", "").strip()
-            group      = row.get("group",      "").strip()
-            subgroups  = row.get("subgroups",  "").strip()
-            if not hexcode or not annotation:
-                continue
-            img_path = img_dir / f"{hexcode}.png"
-            if img_path.exists():
+    skipped = 0
+    try:
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                hexcode    = row.get("hexcode",    "").strip()
+                annotation = row.get("annotation", "").strip()
+                group      = row.get("group",      "").strip()
+                subgroups  = row.get("subgroups",  "").strip()
+                if not hexcode or not annotation:
+                    skipped += 1
+                    continue
+                img_path = img_dir / f"{hexcode}.png"
+                if not img_path.exists():
+                    skipped += 1
+                    continue
                 records.append({
                     "hexcode":    hexcode,
                     "annotation": annotation,
@@ -77,8 +113,14 @@ def load_openmoji(data_dir: str = "data") -> list[dict]:
                     "subgroups":  subgroups,
                     "img_path":   str(img_path),
                 })
+    except OSError as e:
+        print(f"[data] ERROR reading CSV: {e}", file=sys.stderr)
+        return []
 
-    print(f"[data] {len(records)} emoji records loaded.")
+    if skipped:
+        print(f"[data] skipped {skipped} rows (missing image or empty fields)",
+              flush=True)
+    print(f"[data] {len(records)} emoji records loaded.", flush=True)
     return records
 
 
@@ -121,14 +163,21 @@ def annotation_to_bow(annotation: str, vocab: list[str]) -> np.ndarray:
 # ── Image loading ─────────────────────────────────────────────────────────
 
 def load_image(img_path: str) -> np.ndarray:
-    """Load PNG → 100×100 float32 grayscale, normalized [0, 1]."""
+    """Load PNG → 100×100 float32 grayscale, normalized [0, 1].
+    Returns a zero array on any failure (corrupt file, missing PIL, etc.)."""
     try:
-        from PIL import Image
+        from PIL import Image  # soft dependency — fallback to zeros if absent
         img = (Image.open(img_path)
                     .convert("L")
-                    .resize((IMG_SIZE, IMG_SIZE)))
+                    .resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR))
         return np.array(img, dtype=np.float32) / 255.0
-    except Exception:
+    except ImportError:
+        print("[data] WARNING: Pillow not installed — images will be zero arrays.\n"
+              "         Install with: pip install pillow", file=sys.stderr, flush=True)
+        return np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+    except Exception as e:
+        print(f"[data] WARNING: could not load {img_path}: {e}",
+              file=sys.stderr, flush=True)
         return np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
 
 

@@ -21,15 +21,17 @@ using System.Text.Json;
 namespace NetworkController
 {
     public record BenchParams(
-        bool   UseLegacy  = false,
-        int    Iterations = 10
+        bool   UseLegacy       = false,
+        int    Iterations      = 10,
+        int    TimeoutSeconds  = 300
     );
 
     public record NetParams(
-        int    Epochs    = 10,
-        float  Lr        = 0.01f,
-        int    BatchSize = 32,
-        string DataDir   = "data"
+        int    Epochs          = 10,
+        float  Lr              = 0.01f,
+        int    BatchSize       = 32,
+        string DataDir         = "data",
+        int    TimeoutSeconds  = 3600
     );
 
     public static class Program
@@ -37,14 +39,26 @@ namespace NetworkController
         private static readonly string ProjectRoot =
             Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
 
+        private static void Log(string level, string msg)
+        {
+            string ts = DateTime.Now.ToString("HH:mm:ss.fff");
+            var stream = level == "ERR" ? Console.Error : Console.Out;
+            stream.WriteLine($"[{ts}] [{level}] {msg}");
+            stream.Flush();
+        }
+
         public static void Main(string[] args)
         {
             if (args.Length == 0)
             {
                 Console.WriteLine("Usage: NetworkController <command> [options]");
                 Console.WriteLine("Commands: benchA  benchB  pyTorch_nv  pyTorch_i86  pyTorch_risc");
+                Console.WriteLine("Options:  --epochs N  --lr F  --batch-size N  --data-dir PATH");
                 return;
             }
+
+            Log("INF", $"NetworkController start  args=[{string.Join(' ', args)}]");
+            Log("INF", $"ProjectRoot={ProjectRoot}");
 
             NetParams net = ParseNetParams(args[1..]);
 
@@ -56,9 +70,12 @@ namespace NetworkController
                 case "pyTorch_i86":  pyTorch_i86(net);           break;
                 case "pyTorch_risc": pyTorch_risc(net);          break;
                 default:
-                    Console.Error.WriteLine($"[NetworkController] unknown command: {args[0]}");
+                    Log("ERR", $"unknown command: {args[0]}");
+                    Environment.Exit(1);
                     break;
             }
+
+            Log("INF", "NetworkController done");
         }
 
         // ── Benchmark entry points ──────────────────────────────────────────
@@ -66,42 +83,59 @@ namespace NetworkController
         public static void benchA(BenchParams p)
         {
             string bin = Path.Combine(ProjectRoot, "build", "compact_weights_test");
-            RunProcess(bin, "--bench-a", stdinJson: null);
+            if (!File.Exists(bin))
+            {
+                Log("ERR", $"binary not found: {bin}  (run: mkdir build && cd build && cmake .. && make)");
+                return;
+            }
+            RunProcess(bin, "--bench-a", stdinJson: null, p.TimeoutSeconds);
         }
 
         public static void benchB(BenchParams p)
         {
             string bin = Path.Combine(ProjectRoot, "build", "compact_weights_test");
-            RunProcess(bin, "--bench-b", stdinJson: null);
+            if (!File.Exists(bin))
+            {
+                Log("ERR", $"binary not found: {bin}  (run: mkdir build && cd build && cmake .. && make)");
+                return;
+            }
+            RunProcess(bin, "--bench-b", stdinJson: null, p.TimeoutSeconds);
         }
 
         // ── PyTorch backends — always three, never crash on unavailability ──
 
         public static void pyTorch_nv(NetParams p)
-            => RunPython(p, "--backend cuda");
+            => RunPython(p, "--backend cuda", p.TimeoutSeconds);
 
         public static void pyTorch_i86(NetParams p)
-            => RunPython(p, "--backend cpu");
+            => RunPython(p, "--backend cpu", p.TimeoutSeconds);
 
         public static void pyTorch_risc(NetParams p)
-            => RunPython(p, "--backend mps");
+            => RunPython(p, "--backend mps", p.TimeoutSeconds);
 
         // ── Internal helpers ────────────────────────────────────────────────
 
-        private static void RunPython(NetParams p, string backendArg)
+        private static void RunPython(NetParams p, string backendArg, int timeoutSec)
         {
             string script = Path.Combine(ProjectRoot, "emoji_net", "train.py");
-            string args   = $"\"{script}\" {backendArg}"
+            if (!File.Exists(script))
+            {
+                Log("ERR", $"script not found: {script}");
+                return;
+            }
+            string argStr = $"\"{script}\" {backendArg}"
                           + $" --epochs {p.Epochs}"
-                          + $" --lr {p.Lr}"
+                          + $" --lr {p.Lr.ToString(System.Globalization.CultureInfo.InvariantCulture)}"
                           + $" --batch-size {p.BatchSize}"
                           + $" --data-dir \"{p.DataDir}\"";
-            RunProcess("python3", args, stdinJson: JsonSerializer.Serialize(p));
+            RunProcess("python3", argStr, stdinJson: JsonSerializer.Serialize(p), timeoutSec);
         }
 
-        private static void RunProcess(string exe, string arguments, string? stdinJson)
+        private static void RunProcess(string exe, string arguments,
+                                       string? stdinJson, int timeoutSec = 300)
         {
-            Console.WriteLine($"[NetworkController] {exe} {arguments}");
+            Log("INF", $"spawn  {exe} {arguments}");
+            var wall = Stopwatch.StartNew();
 
             var psi = new ProcessStartInfo
             {
@@ -114,8 +148,14 @@ namespace NetworkController
             };
 
             using var proc = new Process { StartInfo = psi };
-            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) Console.WriteLine("[OUT] " + e.Data); };
-            proc.ErrorDataReceived  += (_, e) => { if (e.Data is not null) Console.Error.WriteLine("[ERR] " + e.Data); };
+            proc.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data is not null) Log("OUT", e.Data);
+            };
+            proc.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is not null) Log("ERR", e.Data);
+            };
 
             try
             {
@@ -129,14 +169,24 @@ namespace NetworkController
                     proc.StandardInput.Close();
                 }
 
-                proc.WaitForExit();
-                Console.WriteLine($"[NetworkController] exit {proc.ExitCode}");
+                bool exited = proc.WaitForExit(timeoutSec * 1000);
+                if (!exited)
+                {
+                    Log("ERR", $"timeout after {timeoutSec}s — killing process");
+                    try { proc.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                }
+                else
+                {
+                    Log("INF", $"exit={proc.ExitCode}  elapsed={wall.Elapsed.TotalSeconds:F1}s");
+                    if (proc.ExitCode != 0)
+                        Log("ERR", $"non-zero exit code: {proc.ExitCode}");
+                }
             }
             catch (Exception ex)
             {
-                /* Backend unavailable (binary not found, python not installed, etc.)
-                 * Log and return — never throw, all three backends must remain callable. */
-                Console.Error.WriteLine($"[NetworkController] backend unavailable ({exe}): {ex.Message}");
+                /* Backend unavailable — log and return cleanly.
+                 * All three backends must remain callable even when dead. */
+                Log("ERR", $"backend unavailable ({exe}): {ex.Message}");
             }
         }
 

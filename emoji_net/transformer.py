@@ -12,6 +12,7 @@ Implements:
   softmax(x, axis)
   binary_cross_entropy(logits, targets)
 """
+import sys
 import numpy as np
 from fiver import FiverLayer
 
@@ -43,6 +44,16 @@ def scaled_dot_attention(
     projection layers W_Q, W_K, W_V.  The attention matmuls themselves carry no
     Fiver weights — only W_Q/K/V/O (the projection matrices) are quantized.
     """
+    if Q.ndim != 4 or K.ndim != 4 or V.ndim != 4:
+        raise ValueError(
+            f"scaled_dot_attention expects 4-D inputs (batch,heads,seq,dim), "
+            f"got Q={Q.shape} K={K.shape} V={V.shape}"
+        )
+    if Q.shape[-1] != K.shape[-1]:
+        raise ValueError(
+            f"Q/K last dimension must match: Q={Q.shape} K={K.shape}"
+        )
+
     d_k = Q.shape[-1]
 
     # ── 1. Score matrix: QKᵀ / √d_k ──────────────────────────────────────
@@ -56,9 +67,14 @@ def scaled_dot_attention(
 
     # ── 3. Numerically stable softmax over key dimension ─────────────────
     #    Subtract max before exp to prevent overflow (log-sum-exp trick).
-    scores_stable   = scores - scores.max(axis=-1, keepdims=True)
-    exp_scores      = np.exp(scores_stable)
-    attn_weights    = exp_scores / (exp_scores.sum(axis=-1, keepdims=True) + 1e-9)
+    scores_stable = scores - scores.max(axis=-1, keepdims=True)
+    exp_scores    = np.exp(scores_stable)
+    attn_weights  = exp_scores / (exp_scores.sum(axis=-1, keepdims=True) + 1e-9)
+
+    if not np.all(np.isfinite(attn_weights)):
+        print("[transformer] WARNING: NaN/Inf in attention weights — "
+              "possible score overflow", file=sys.stderr, flush=True)
+        attn_weights = np.nan_to_num(attn_weights, nan=0.0, posinf=0.0)
 
     # ── 4. Context vector: weighted sum over values ───────────────────────
     #    Shape: (batch, heads, seq_q, d_v)

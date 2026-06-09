@@ -20,6 +20,26 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Error-checking macro: prints file/line on CUDA failure and aborts. */
+#define CW_CUDA_CHECK(call)                                                   \
+    do {                                                                       \
+        cudaError_t _e = (call);                                               \
+        if (_e != cudaSuccess) {                                               \
+            fprintf(stderr, "[CW ERROR] %s:%d  %s: %s\n",                    \
+                    __FILE__, __LINE__, #call, cudaGetErrorString(_e));        \
+            exit(EXIT_FAILURE);                                                \
+        }                                                                      \
+    } while (0)
+
+/* Non-fatal warning variant — logs but continues. */
+#define CW_CUDA_WARN(call)                                                    \
+    do {                                                                       \
+        cudaError_t _e = (call);                                               \
+        if (_e != cudaSuccess)                                                 \
+            fprintf(stderr, "[CW WARN]  %s:%d  %s: %s\n",                    \
+                    __FILE__, __LINE__, #call, cudaGetErrorString(_e));        \
+    } while (0)
+
 
 /*
  * ╔══════════════════════════════════════════════════════════════════════╗
@@ -380,32 +400,32 @@ static void run_benchmark(const char* label, int use_quake, int iterations) {
         h_ref[i]   = 1.0f / sqrtf(h_in[i]);
     }
 
-    cudaMalloc(&d_in,  N * sizeof(float));
-    cudaMalloc(&d_out, N * sizeof(float));
-    cudaMemcpy(d_in, h_in, N * sizeof(float), cudaMemcpyHostToDevice);
+    CW_CUDA_CHECK(cudaMalloc(&d_in,  N * sizeof(float)));
+    CW_CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(float)));
+    CW_CUDA_CHECK(cudaMemcpy(d_in, h_in, N * sizeof(float), cudaMemcpyHostToDevice));
 
     /* Warm-up pass */
     if (use_quake) bench_kernel_quake<<<(N+127)/128, 128>>>(d_in, d_out, N);
     else           bench_kernel_hw   <<<(N+127)/128, 128>>>(d_in, d_out, N);
-    cudaDeviceSynchronize();
+    CW_CUDA_CHECK(cudaDeviceSynchronize());
 
     /* Timed passes */
     cudaEvent_t t0, t1;
-    cudaEventCreate(&t0);
-    cudaEventCreate(&t1);
-    cudaEventRecord(t0);
+    CW_CUDA_CHECK(cudaEventCreate(&t0));
+    CW_CUDA_CHECK(cudaEventCreate(&t1));
+    CW_CUDA_CHECK(cudaEventRecord(t0));
     for (int it = 0; it < iterations; it++) {
         if (use_quake) bench_kernel_quake<<<(N+127)/128, 128>>>(d_in, d_out, N);
         else           bench_kernel_hw   <<<(N+127)/128, 128>>>(d_in, d_out, N);
     }
-    cudaEventRecord(t1);
-    cudaDeviceSynchronize();
+    CW_CUDA_CHECK(cudaEventRecord(t1));
+    CW_CUDA_CHECK(cudaDeviceSynchronize());
 
     float ms = 0.0f;
-    cudaEventElapsedTime(&ms, t0, t1);
+    CW_CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
     float ns_per_op = (ms * 1e6f) / ((float)iterations * (float)N);
 
-    cudaMemcpy(h_out_gpu, d_out, N * sizeof(float), cudaMemcpyDeviceToHost);
+    CW_CUDA_CHECK(cudaMemcpy(h_out_gpu, d_out, N * sizeof(float), cudaMemcpyDeviceToHost));
 
     double max_err = 0.0, sum_err = 0.0;
     for (uint32_t i = 0; i < N; i++) {
@@ -425,9 +445,11 @@ static void run_benchmark(const char* label, int use_quake, int iterations) {
            CW_SQRT2_LOW,
            fabsf(CW_SQRT2_LOW  - exact_s2) / exact_s2 * 100.0f);
 
-    cudaFree(d_in); cudaFree(d_out);
+    CW_CUDA_WARN(cudaFree(d_in));
+    CW_CUDA_WARN(cudaFree(d_out));
     free(h_in); free(h_out_gpu); free(h_ref);
-    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    CW_CUDA_WARN(cudaEventDestroy(t0));
+    CW_CUDA_WARN(cudaEventDestroy(t1));
 }
 
 static void run_fiver_test(void) {
@@ -439,13 +461,14 @@ static void run_fiver_test(void) {
     for (uint32_t k = 0; k < 32; k++) h_fiver[k] = (uint8_t)k;
     for (uint32_t k = 0; k < 32; k++) h_ref[k]   = cw_fiver_to_float_cpu((uint8_t)k);
 
-    cudaMalloc(&d_fiver, 32);
-    cudaMalloc(&d_out,   32 * sizeof(float));
-    cudaMemcpy(d_fiver, h_fiver, 32, cudaMemcpyHostToDevice);
+    CW_CUDA_CHECK(cudaMalloc(&d_fiver, 32));
+    CW_CUDA_CHECK(cudaMalloc(&d_out,   32 * sizeof(float)));
+    CW_CUDA_CHECK(cudaMemcpy(d_fiver, h_fiver, 32, cudaMemcpyHostToDevice));
 
     cw_materialize_f32<<<1, 128>>>(d_fiver, NULL, NULL, d_out, N, 0);
-    cudaDeviceSynchronize();
-    cudaMemcpy(h_out, d_out, 32 * sizeof(float), cudaMemcpyDeviceToHost);
+    CW_CUDA_CHECK(cudaGetLastError());
+    CW_CUDA_CHECK(cudaDeviceSynchronize());
+    CW_CUDA_CHECK(cudaMemcpy(h_out, d_out, 32 * sizeof(float), cudaMemcpyDeviceToHost));
 
     printf("\n%-4s  %-10s  %-10s  %-12s\n", "k", "expected", "got", "abs_err");
     printf("%.50s\n", "--------------------------------------------------");
@@ -459,12 +482,30 @@ static void run_fiver_test(void) {
     printf("\nFiver test: %u / 32 errors\n", errors);
     printf("TEST %s\n", errors == 0 ? "PASSED" : "FAILED");
 
-    cudaFree(d_fiver); cudaFree(d_out);
+    CW_CUDA_WARN(cudaFree(d_fiver));
+    CW_CUDA_WARN(cudaFree(d_out));
+}
+
+static void print_device_info(void) {
+    int dev = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[CW WARN]  no CUDA device available: %s\n",
+                cudaGetErrorString(e));
+        return;
+    }
+    cudaDeviceProp prop;
+    CW_CUDA_WARN(cudaGetDeviceProperties(&prop, dev));
+    printf("[device]  %s  (sm_%d%d)  %.0f MB global  %d SMs\n\n",
+           prop.name, prop.major, prop.minor,
+           (double)prop.totalGlobalMem / (1024.0 * 1024.0),
+           prop.multiProcessorCount);
 }
 
 int main(int argc, char** argv) {
     printf("compact_weights — Symmetric Fiver Encoding\n");
     printf("===========================================\n\n");
+    print_device_info();
 
     int do_a = 0, do_b = 0, do_t = 0;
     for (int i = 1; i < argc; i++) {
