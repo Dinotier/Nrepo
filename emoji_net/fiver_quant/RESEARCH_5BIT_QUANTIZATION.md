@@ -44,6 +44,7 @@ Zum Vergleich:
 | Q4_K_M  | 4         | 4.89     | +1.20%                            | 4.58        |
 | Q5_K_S  | 5         | 5.57     | —                                 | 5.21        |
 | Q5_K_M  | 5         | 5.70     | **+0.40%**                        | 5.33        |
+| Fiver-W | 5.333 eff | 5.333    | TBD (triplet-sign approx.)        | —           |
 | Q6_K    | 6         | 6.56     | +0.16%                            | 5.21        |
 | Q8_0    | 8         | 8.50     | ~0.0%                             | 7.95        |
 
@@ -150,17 +151,50 @@ Neuestes Paper zur RWKV-Quantisierung:
 
 ## 6. Einordnung des Fiver-Ansatzes
 
-### 6.1 Was Fiver anders macht
+### 6.1 Speicherformat: Fiver-Word (3-per-uint16)
 
-| Eigenschaft           | llama.cpp Q5_K    | APoT              | Fiver                          |
-|-----------------------|-------------------|-------------------|-------------------------------|
-| Bit-Breite            | 5 (eff. 5.5–5.7)  | 4 (primär)        | 5 (genau)                     |
-| Encoding              | Uniform + Scale   | Σ 2^(-i)          | 1 ± 2^(-k/4), monoton         |
-| Anker                 | keiner            | keiner            | w(k=15)=1.0 explizit          |
-| Unsigned-Modus        | nein              | nein              | ja (use_sign=False)           |
-| Ziel-Layer            | alle Linear       | CNN-Gewichte      | Embeddings, Norms, RWKV-W     |
-| Hardware              | GGML/CPU          | ASIC-optimiert    | CUDA + CPU (diese Arbeit)     |
-| Offene GGUF-Integration | ja (natives Format) | nein            | Q5_FIVER=0x0105 vorgeschlagen |
+Drei k-Werte teilen sich ein 16-Bit-Wort mit **einem gemeinsamen Vorzeichenbit**:
+
+```
+┌────┬─────────┬─────────┬─────────┐
+│ S  │   k2    │   k1    │   k0    │
+│ 15 │ 14 – 10 │  9 – 5  │  4 – 0  │
+└────┴─────────┴─────────┴─────────┘
+
+S   = shared sign für alle drei Gewichte im Wort
+      0 → alle positiv,  1 → alle negativ
+k ∈ [0..31]:  w(k) = 1 ± 2^(−mag(k)/4)
+```
+
+Effektiver Speicherbedarf: **16 bit / 3 Werte = 5.333 bpw → 6.0× Kompression vs FP32**
+
+Das gemeinsame VZ-Bit ist eine bewusste Approximation:
+- **Unsigned Layer** (RMSNorm, RWKV-W): S = 0 immer → kein Informationsverlust
+- **Signed Layer** (Embeddings, Projektionen): Mehrheitsentscheid über das Triplet;
+  das Minoritäts-Element wird mit falschem Vorzeichen rekonstruiert
+
+Rekonstruktion pro Wort:
+```python
+sign  = -1.0 if (word >> 15) else +1.0
+k0    =  word        & 0x1F
+k1    = (word >>  5) & 0x1F
+k2    = (word >> 10) & 0x1F
+w_i   = sign * scale * fiver_values[k_i]   # für i in {0, 1, 2}
+```
+
+### 6.2 Was Fiver anders macht
+
+| Eigenschaft           | llama.cpp Q5_K      | APoT              | Fiver                          |
+|-----------------------|---------------------|-------------------|-------------------------------|
+| Eff. Bit-Breite       | 5.5 – 5.7 bpw       | 4 (primär)        | **5.333 bpw** (16/3)          |
+| Kompression vs FP32   | 5.6×                | ~8×               | **6.0×**                      |
+| Encoding              | Uniform + Scale     | Σ 2^(-i)          | 1 ± 2^(-k/4), monoton         |
+| Anker                 | keiner              | keiner            | w(k=15)=1.0 explizit          |
+| Unsigned-Modus        | nein                | nein              | ja (use_sign=False, S=0)      |
+| Vorzeichen-Granularität | pro Block          | pro Wert          | **pro Triplet** (shared S)    |
+| Ziel-Layer            | alle Linear         | CNN-Gewichte      | Embeddings, Norms, RWKV-W     |
+| Hardware              | GGML/CPU            | ASIC-optimiert    | CUDA + CPU (diese Arbeit)     |
+| GGUF-Integration      | ja (nativ)          | nein              | Q5_FIVER=0x0105 vorgeschlagen |
 
 ### 6.2 Wo Fiver am besten passt (nach Recherche)
 
@@ -171,7 +205,7 @@ Neuestes Paper zur RWKV-Quantisierung:
 
 2. **Embedding-Gewichte** (embed_tokens, lm_head)
    - LLaMA-3.1-8B: 128K × 4096 = 524M Parameter = **2 GB in FP32**
-   - Fiver mit per-tensor scale: ~313 MB (6.4× Kompression)
+   - Fiver-Word: ~333 MB (6.0× Kompression, 16/3 bpw)
    - Q5_K_M lässt diese Layer bei FP16 → Fiver füllt diese Lücke
 
 3. **RWKV time-decay W-Vektoren**
@@ -194,7 +228,7 @@ FP16          16      2.0×      ~0.0
 Q8_0           8.5   3.8×      ~0.0
 Q6_K           6.6   4.8×      +0.16%
 Q5_K_M         5.7   5.6×      +0.40%   ← Fiver-Zielbereich
-Fiver (exact)  5.0   6.4×      TBD (layer-spezifisch)
+Fiver-Word     5.333 6.0×      TBD (triplet-sign approx.)
 Q4_K_M         4.9   6.6×      +1.20%
 RTN W4A16      4.0   8.0×      +~2%
 GPTQ W4A16     4.0   8.0×      +1.5%
@@ -203,9 +237,10 @@ QuIP# W3       3.0  10.7×      +~2% (besser als RTN)
 SqueezeLLM W3  3.0  10.7×      +0.67 ppl abs.
 ```
 
-**Fiver positioniert sich zwischen Q5_K_M und Q4_K_M** bei echter 5-Bit-Dichte
-(6.4× statt 5.6×), weil kein Scale-Overhead per Block anfällt — nur ein Scale
-pro Tensor.
+**Fiver-Word positioniert sich zwischen Q5_K_M und Q4_K_M**: 6.0× Kompression
+bei 5.333 bpw (16 bit / 3 Werte), mit word-aligntem Speicher für GPU-Effizienz.
+Der Overhead gegenüber tight-packed 5.0 bpw beträgt nur 6.7% mehr Speicher
+(5.333 vs 5.0 bpw), dafür sind Lesezugriffe natürlich wort-aligned.
 
 ---
 
