@@ -246,7 +246,7 @@ def convert_to_gguf(args: argparse.Namespace) -> None:
     kv_block += _gguf_kv_uint32("general.quant_type",    GGML_TYPE_Q5_FIVER)
     kv_block += _gguf_kv_string("general.source",        str(source_label))
     kv_block += _gguf_kv_string("fiver.packing",
-        "3-per-uint16: [S:1|k2:5|k1:5|k0:5], S=shared sign (majority vote)")
+        args.pack + ": u16=3-per-word 1-bit-sign, u32=6-per-word 2-bit-sign")
     kv_block += _gguf_kv_string("fiver.formula",
         "w(k)=1+2^(-(31-k)/4) if k>=16 else 1-2^(-k/4); reconstructed *= sign*scale")
     kv_block += _gguf_kv_string("fiver.bpw",             "5.333 (16/3)")
@@ -304,4 +304,7 @@ if __name__ == "__main__":
                      help="One or more .npz files to include directly")
     ap.add_argument("--out", default="./fiver_quant.gguf",
                     help="Output .gguf file path (default: ./fiver_quant.gguf)")
+    ap.add_argument("--pack", choices=["u16", "u32"], default="u16",
+                    help="u16: 3 values per uint16 + 1-bit sign (default); "
+                         "u32: 6 values per uint32 + 2-bit sign (4 patterns)")
     convert_to_gguf(ap.parse_args())
