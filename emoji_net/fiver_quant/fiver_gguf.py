@@ -1,39 +1,44 @@
 """
 fiver_gguf.py — Convert Fiver-quantized .npz files to a GGUF-compatible layout.
 
-Storage format: Q5_FIVER / "Fiver-Word"
+Storage format: Q5_FIVER — one uint32 word = 6 weights + 2 sign bits
 ═══════════════════════════════════════════════════════════════════════════════
 
-Three k-values share one uint16_t word, with a single shared sign bit:
+S_lo is the shared sign of k0..k2, S_hi of k3..k5 (majority vote per triplet).
+Both layouts carry identical information; only the bit positions differ.
+They match the CUDA kernel cw_fiver_gemv in compact_weights.cu exactly.
 
-    ┌────┬─────────┬─────────┬─────────┐
-    │ S  │   k2    │   k1    │   k0    │
-    │ 15 │ 14 – 10 │  9 – 5  │  4 – 0  │
-    └────┴─────────┴─────────┴─────────┘
+  --pack u16 (default): two little-endian uint16 triplets [S|k2|k1|k0]
+    ┌──────┬─────┬─────┬─────┬──────┬─────┬─────┬─────┐
+    │S_hi  │ k5  │ k4  │ k3  │S_lo  │ k2  │ k1  │ k0  │
+    │ 31   │30-26│25-21│20-16│ 15   │14-10│ 9-5 │ 4-0 │
+    └──────┴─────┴─────┴─────┴──────┴─────┴─────┴─────┘
 
-  S   = shared sign bit for all three weights in this word
-        0 → all three positive,  1 → all three negative
-  k0–k2 ∈ [0..31]:  w(k) = 1 ± 2^(−|dir(k)|/4)
+  --pack u32: sextet with 2-bit sign code on top
+    ┌──────┬──────┬─────┬─────┬─────┬─────┬─────┬─────┐
+    │S_lo  │S_hi  │ k5  │ k4  │ k3  │ k2  │ k1  │ k0  │
+    │ 31   │ 30   │29-25│24-20│19-15│14-10│ 9-5 │ 4-0 │
+    └──────┴──────┴─────┴─────┴─────┴─────┴─────┴─────┘
+    (S_lo S_hi) = 00 all+, 11 all−, 10 −−−+++, 01 +++−−−
 
-Effective storage cost: 16 bits / 3 values = 5.333 bpw
-Compression vs FP32: 32 / 5.333 ≈ 6.0×
+  k ∈ [0..31]:  w(k) = 1 − 2^(−k/4) for k<16,  1 + 2^(−(31−k)/4) for k≥16
+  32 bits / 6 values = 5.333 bpw → ~6.0× vs FP32
+
+Row padding:
+  The tensor is viewed as (rows, cols) with cols = last dimension.  Each row
+  is padded to a multiple of 6 with k=0, sign=0; w(0) = 0.0, so padding never
+  contributes to a dot product.  Row r starts at word r·ceil(cols/6).
 
 Sign approximation:
-  For purely unsigned layers (RMSNorm γ, RWKV time-decay W) S is always 0 —
-  no information is lost.
-  For signed layers (embeddings, projections) a majority-vote sign is used per
-  triplet: if ≥2 of the three values are negative, S=1.  The minority element
-  is reconstructed with the wrong sign — this is the intended approximation.
-  ("wir hoffen drauf dass es klappt")
-
-Tail padding:
-  If len(k_data) % 3 ≠ 0, the last word is zero-padded (k_pad=0, S=0).
+  Unsigned layers (RMSNorm γ, RWKV time-decay W): sign bits are always 0 —
+  no information lost.  Signed layers: the minority element of a triplet is
+  reconstructed with the wrong sign ("wir hoffen drauf dass es klappt").
 
 Layout per tensor block in the GGUF data section:
-  ┌──────────────────────────────────────────────┐
-  │  ceil(n/3) × uint16_t  (little-endian words) │
-  │  4 bytes float32  scale                      │
-  └──────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │  rows × ceil(cols/6) × uint32  (little-endian words)     │
+  │  4 bytes float32  scale                                  │
+  └──────────────────────────────────────────────────────────┘
 
 GGUF type assignment:
   0x0000–0x00FF  reserved (llama.cpp official)
@@ -66,85 +71,76 @@ GGML_TYPE_Q5_FIVER = 0x0105        # Fiver word format; not yet in llama.cpp mai
 
 # ── Packing / unpacking ───────────────────────────────────────────────────────
 
-def pack_triplets(k_data: np.ndarray, sign_bits: np.ndarray | None) -> bytes:
+LAYOUTS = ("u16", "u32")
+
+
+def _k_shifts(layout: str) -> list[int]:
+    return [0, 5, 10, 16, 21, 26] if layout == "u16" else [0, 5, 10, 15, 20, 25]
+
+
+def _sign_shifts(layout: str) -> tuple[int, int]:
+    """(S_lo, S_hi) bit positions."""
+    return (15, 31) if layout == "u16" else (31, 30)
+
+
+def _as_rows(a: np.ndarray) -> np.ndarray:
+    return a.reshape(1, -1) if a.ndim <= 1 else a.reshape(-1, a.shape[-1])
+
+
+def pack_fiver(k_data: np.ndarray, sign_bits: np.ndarray | None,
+               layout: str = "u16") -> bytes:
     """
-    Pack k_data (uint8, values 0–31) + optional per-element sign_bits into
-    Fiver-Word uint16_t array.
-
-    Layout per word (little-endian):
-      bit 15   : shared sign (majority vote over the triplet)
-      bits 14-10: k2
-      bits  9- 5: k1
-      bits  4- 0: k0
-
-    Parameters
-    ----------
-    k_data    : uint8 ndarray, any shape, values in [0..31]
-    sign_bits : uint8 ndarray same shape (0=pos, 1=neg), or None for unsigned
-
-    Returns
-    -------
-    bytes  — little-endian uint16_t array, length = ceil(n/3) × 2 bytes
+    Pack k_data (uint8, 0..31) + optional per-element sign_bits into
+    row-padded uint32 words (6 weights each).  See module docstring.
     """
-    flat_k = k_data.ravel().astype(np.uint32)
-    n = len(flat_k)
+    if layout not in LAYOUTS:
+        raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
+    k = _as_rows(k_data).astype(np.uint32)
+    s = (_as_rows(sign_bits).astype(np.uint32) if sign_bits is not None
+         else np.zeros_like(k))
 
-    if sign_bits is not None:
-        flat_s = sign_bits.ravel().astype(np.uint32)
-    else:
-        flat_s = np.zeros(n, dtype=np.uint32)
-
-    # Pad to multiple of 3
-    pad = (-n) % 3
+    rows, cols = k.shape
+    pad = (-cols) % 6
+    real = np.ones_like(k)
     if pad:
-        flat_k = np.concatenate([flat_k, np.zeros(pad, dtype=np.uint32)])
-        flat_s = np.concatenate([flat_s, np.zeros(pad, dtype=np.uint32)])
+        k    = np.pad(k,    ((0, 0), (0, pad)))
+        s    = np.pad(s,    ((0, 0), (0, pad)))
+        real = np.pad(real, ((0, 0), (0, pad)))
 
-    k_mat = flat_k.reshape(-1, 3)   # (G, 3): k_mat[:,0]=k0, [:,1]=k1, [:,2]=k2
-    s_mat = flat_s.reshape(-1, 3)   # (G, 3): sign per element
+    k6, s6, r6 = (a.reshape(rows, -1, 6) for a in (k, s, real))
+    # Majority over the real (non-padding) elements of each triplet; ties → +
+    s_lo = (2 * s6[..., :3].sum(axis=-1) > r6[..., :3].sum(axis=-1)).astype(np.uint32)
+    s_hi = (2 * s6[..., 3:].sum(axis=-1) > r6[..., 3:].sum(axis=-1)).astype(np.uint32)
 
-    # Majority-vote shared sign: S=1 if ≥2 of the three signs are 1
-    shared_sign = (s_mat.sum(axis=1) >= 2).astype(np.uint32)  # (G,)
+    sh_lo, sh_hi = _sign_shifts(layout)
+    words = (s_lo << sh_lo) | (s_hi << sh_hi)
+    for i, sh in enumerate(_k_shifts(layout)):
+        words |= (k6[..., i] & 0x1F) << sh
 
-    # Pack: word = (S<<15) | (k2<<10) | (k1<<5) | k0
-    words = ((shared_sign << 15)
-             | ((k_mat[:, 2] & 0x1F) << 10)
-             | ((k_mat[:, 1] & 0x1F) << 5)
-             |  (k_mat[:, 0] & 0x1F)).astype(np.uint16)
-
-    return words.tobytes()          # little-endian on all x86/ARM hosts
+    return words.astype("<u4").tobytes()
 
 
-def unpack_triplets(buf: bytes, n: int) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Inverse of pack_triplets.
+def unpack_fiver(buf: bytes, shape: tuple, layout: str = "u16") -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of pack_fiver → (k_data, sign_bits), both uint8 with `shape`."""
+    if layout not in LAYOUTS:
+        raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
+    cols = int(shape[-1]) if len(shape) else 1
+    rows = int(np.prod(shape)) // max(cols, 1)
+    wpr  = (cols + 5) // 6
 
-    Parameters
-    ----------
-    buf : bytes produced by pack_triplets
-    n   : number of original elements (to strip tail padding)
+    words = np.frombuffer(buf, dtype="<u4", count=rows * wpr).reshape(rows, wpr)
+    sh_lo, sh_hi = _sign_shifts(layout)
+    s_lo = ((words >> sh_lo) & 1).astype(np.uint8)
+    s_hi = ((words >> sh_hi) & 1).astype(np.uint8)
 
-    Returns
-    -------
-    k_data    : uint8 ndarray, shape (n,)
-    sign_bits : uint8 ndarray, shape (n,)
-    """
-    words = np.frombuffer(buf, dtype=np.uint16).astype(np.uint32)
-    shared_sign = ((words >> 15) & 1).astype(np.uint8)
-    k2 = ((words >> 10) & 0x1F).astype(np.uint8)
-    k1 = ((words >>  5) & 0x1F).astype(np.uint8)
-    k0 = ( words        & 0x1F).astype(np.uint8)
+    k = np.stack([((words >> sh) & 0x1F).astype(np.uint8) for sh in _k_shifts(layout)],
+                 axis=-1)                                      # (rows, wpr, 6)
+    s = np.concatenate([np.repeat(s_lo[..., None], 3, axis=-1),
+                        np.repeat(s_hi[..., None], 3, axis=-1)], axis=-1)
 
-    # Interleave: [k0, k1, k2, k0, k1, k2, ...]
-    g = len(words)
-    k_flat    = np.empty(g * 3, dtype=np.uint8)
-    sign_flat = np.empty(g * 3, dtype=np.uint8)
-    k_flat[0::3] = k0;  k_flat[1::3] = k1;  k_flat[2::3] = k2
-    sign_flat[0::3] = shared_sign
-    sign_flat[1::3] = shared_sign
-    sign_flat[2::3] = shared_sign
-
-    return k_flat[:n], sign_flat[:n]
+    k = k.reshape(rows, wpr * 6)[:, :cols].reshape(shape)
+    s = s.reshape(rows, wpr * 6)[:, :cols].reshape(shape)
+    return k, s
 
 
 # ── GGUF helpers ─────────────────────────────────────────────────────────────
@@ -212,11 +208,15 @@ def convert_to_gguf(args: argparse.Namespace) -> None:
         shape     = tuple(int(x) for x in d["shape"]) if "shape" in d else k_data.shape
         n         = int(np.prod(shape))
 
-        packed = pack_triplets(k_data, sign_bits)
-        n_words = len(packed) // 2
-        bpw     = len(packed) * 8 / n         # ≈ 5.333 for non-padded tensors
+        k_data = k_data.reshape(shape)
+        if sign_bits is not None:
+            sign_bits = sign_bits.reshape(shape)
 
-        # Tensor data block: packed uint16 words + float32 scale
+        packed  = pack_fiver(k_data, sign_bits, args.pack)
+        n_words = len(packed) // 4
+        bpw     = len(packed) * 8 / n         # 5.333 when cols % 6 == 0
+
+        # Tensor data block: packed uint32 words + float32 scale
         scale_bytes = struct.pack("<f", scale_val)
         tensor_data = packed + scale_bytes
 
@@ -246,7 +246,7 @@ def convert_to_gguf(args: argparse.Namespace) -> None:
     kv_block += _gguf_kv_uint32("general.quant_type",    GGML_TYPE_Q5_FIVER)
     kv_block += _gguf_kv_string("general.source",        str(source_label))
     kv_block += _gguf_kv_string("fiver.packing",
-        args.pack + ": u16=3-per-word 1-bit-sign, u32=6-per-word 2-bit-sign")
+        args.pack + ": uint32 word = 6 weights + S_lo/S_hi; rows padded to 6 (k=0)")
     kv_block += _gguf_kv_string("fiver.formula",
         "w(k)=1+2^(-(31-k)/4) if k>=16 else 1-2^(-k/4); reconstructed *= sign*scale")
     kv_block += _gguf_kv_string("fiver.bpw",             "5.333 (16/3)")
@@ -288,7 +288,7 @@ def convert_to_gguf(args: argparse.Namespace) -> None:
     total_bytes = out_path.stat().st_size
     print(f"\n[fiver_gguf] wrote {out_path}  ({total_bytes/1e6:.2f} MB, "
           f"{len(packed_tensors)} tensors)")
-    print(f"[fiver_gguf] format: 3 k-values per uint16, shared sign bit, "
+    print(f"[fiver_gguf] format: {args.pack}, 6 k-values + 2 sign bits per uint32, "
           f"5.333 bpw, ~6.0× vs FP32")
     print(f"[fiver_gguf] quant_type=0x{GGML_TYPE_Q5_FIVER:04X} (Q5_FIVER)")
     print(f"[fiver_gguf] total time: {time.time()-t0:.1f}s", flush=True)
