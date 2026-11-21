@@ -50,7 +50,8 @@
  */
 
 /* Improved Quake III inverse-sqrt constant — no Newton-Raphson step.
- * Raw error vs exact rsqrt: up to ~0.17%.  Used in benchA() only. */
+ * Raw error vs exact rsqrt: up to 3.44% (0.175% would need one NR step).
+ * Used in benchA() only. */
 #define CW_QUAKE_CONST       0x5F375A86U
 
 /* sqrt(2) as IEEE 754 single precision:
