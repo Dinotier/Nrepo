@@ -1,53 +1,56 @@
 """
-fiver.py — Symmetric 5-bit Fiver weight encoding.
+fiver.py — Fiver 5-bit weight encoding for training (EmojiNet).
 
-Encoding: k in [0..31], MSB (bit4) encodes direction, bits[3:0] = magnitude.
-  k in [ 0..15] (bit4=0): w = 1 - 2^(-k/4)       range [0.0  .. 0.926]
-  k in [16..31] (bit4=1): w = 1 + 2^(-(31-k)/4)   range [1.074 .. 2.0 ]
+Code k ∈ [0..31], two value grids (identical to compact_weights.cu):
 
-Values are monotonically increasing with k.
-Distribution is sigmoid-shaped: fine resolution near 1.0, coarse at extremes.
-No separate sign/formula arrays — direction is implicit in the MSB.
+  centered (default):  v(k) = −2^(−k/4) for k < 16,  v(16) = 0,  +2^(−(31−k)/4) for k > 16
+                       signed weights, sign = MSB of k, no sign bits
+  anchored (original): w(k) = 1 − 2^(−k/4) for k < 16,  1 + 2^(−(31−k)/4) for k ≥ 16
+                       positive weights in [0, 2], dense around 1
 
-STE update rule: k += -sign(grad), saturating at [0, 31].
-One integer increment/decrement per weight per step.
+Both grids are strictly increasing in k.  Effective weight W = scale · v(k)
+with a fixed per-layer scale (centered: 2/√in_dim, anchored: 1).
+
+STE update rule: k −= sign(lr · ∂L/∂W), saturating at [0, 31].
+One integer increment/decrement per weight per step; on the centered grid a
+weight changes sign by walking through code 16.
 """
 import numpy as np
 
-# 16-entry LUT: delta_lut[m] = 2^(-m/4) for m = 0..15
-DELTA_LUT = np.array([2.0**(-m / 4.0) for m in range(16)], dtype=np.float32)
+_DELTA = 2.0 ** (-np.arange(16) / 4.0)
+ANCHORED = np.r_[1.0 - _DELTA, (1.0 + _DELTA)[::-1]].astype(np.float32)
+CENTERED = (ANCHORED - 1.0).astype(np.float32)
+CENTERED[16] = 0.0
+GRIDS = {"centered": CENTERED, "anchored": ANCHORED}
 
 
-def fiver_to_float(k: np.ndarray) -> np.ndarray:
-    """Materialize Fiver k-values (uint8, [0..31]) to float32 weights."""
-    k   = np.asarray(k, dtype=np.uint8)
-    dir_ = (k >> 4) & 1                      # MSB: 0=below 1.0, 1=above 1.0
-    mag  = np.where(dir_, 31 - k, k) & 0xF   # magnitude index 0..15
-    delta = DELTA_LUT[mag]
-    return (1.0 + np.where(dir_, +delta, -delta)).astype(np.float32)
+def fiver_to_float(k: np.ndarray, grid: str = "centered") -> np.ndarray:
+    """Materialize Fiver codes (uint8, [0..31]) to float32 values of the grid."""
+    return GRIDS[grid][np.asarray(k, dtype=np.uint8)]
 
 
 class FiverLayer:
     """Dense layer with Fiver-quantized weights and float32 biases.
 
-    All weight gradient accumulation uses the STE (Straight-Through Estimator):
-    gradients flow through materialize() as if it were the identity function.
-    The discrete update is: k -= sign(grad_k) (saturating).
+    Gradients flow through materialize() as if it were the identity (STE).
+    The discrete update is k −= sign(grad) (saturating); since every grid is
+    increasing in k and scale > 0, sign(∂L/∂k) = sign(∂L/∂W).
     """
 
     def __init__(self, in_dim: int, out_dim: int, act: str = 'identity',
-                 use_sign: bool = False, seed: int = 0):
-        self.in_dim   = in_dim
-        self.out_dim  = out_dim
-        self.act      = act
-        self.use_sign = use_sign
+                 grid: str = 'centered', seed: int = 0):
+        if grid not in GRIDS:
+            raise ValueError(f"grid must be one of {sorted(GRIDS)}, got {grid!r}")
+        self.in_dim  = in_dim
+        self.out_dim = out_dim
+        self.act     = act
+        self.grid    = grid
+        self.scale   = np.float32(2.0 / np.sqrt(in_dim) if grid == 'centered' else 1.0)
 
         rng = np.random.default_rng(seed)
-        # Initialize k near center (w close to 1.0) for stable early training
-        self.k_data   = rng.integers(12, 20, size=(out_dim, in_dim), dtype=np.uint8)
-        self.sign_bits = (np.zeros((out_dim, in_dim), dtype=np.uint8)
-                          if use_sign else None)
-        self.bias = np.zeros(out_dim, dtype=np.float32)
+        # Codes 12..20: centered → small weights around 0, anchored → around 1.0
+        self.k_data = rng.integers(12, 21, size=(out_dim, in_dim), dtype=np.uint8)
+        self.bias   = np.zeros(out_dim, dtype=np.float32)
 
         self._grad_k    = np.zeros((out_dim, in_dim), dtype=np.float32)
         self._grad_bias = np.zeros(out_dim, dtype=np.float32)
@@ -56,48 +59,36 @@ class FiverLayer:
 
     def materialize(self) -> np.ndarray:
         """Return float32 weight matrix (out_dim × in_dim)."""
-        w = fiver_to_float(self.k_data)
-        if self.use_sign and self.sign_bits is not None:
-            w = w * np.where(self.sign_bits, -1.0, 1.0)
-        return w
+        return self.scale * fiver_to_float(self.k_data, self.grid)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         """x: (..., in_dim) → (..., out_dim)"""
-        W   = self.materialize()                   # (out_dim, in_dim)
-        out = x @ W.T + self.bias                  # (..., out_dim)
+        out = x @ self.materialize().T + self.bias
         return _apply_act(out, self.act)
 
     # ── Backward ─────────────────────────────────────────────────────────
 
     def backward(self, x: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
         """Accumulate gradients via STE. Returns grad_x."""
-        pre_act = x @ self.materialize().T + self.bias
-        g       = _act_grad(grad_out, self.act, pre_act)  # through activation
+        W       = self.materialize()
+        pre_act = x @ W.T + self.bias
+        g       = _act_grad(grad_out, self.act, pre_act)
 
-        # Flatten batch dimensions for gradient accumulation
-        x_flat  = x.reshape(-1, self.in_dim)
-        g_flat  = g.reshape(-1, self.out_dim)
+        x_flat = x.reshape(-1, self.in_dim)
+        g_flat = g.reshape(-1, self.out_dim)
 
-        self._grad_k    += g_flat.T @ x_flat         # (out_dim, in_dim)
+        self._grad_k    += g_flat.T @ x_flat         # ∂L/∂W up to the positive scale
         self._grad_bias += g_flat.sum(axis=0)
 
-        return g @ self.materialize()                 # grad_x: (..., in_dim)
+        return g @ W                                  # grad_x: (..., in_dim)
 
     # ── Parameter update ─────────────────────────────────────────────────
 
     def step(self, lr: float):
-        """STE discrete update: k -= sign(σ · grad), saturating [0,31].
-
-        w = σ · f(k) with f increasing, so ∂L/∂k has the sign of σ · ∂L/∂w.
-        Same rule as cw_fiver_ste_update in compact_weights.cu.
-        """
-        g = self._grad_k * lr
-        if self.use_sign and self.sign_bits is not None:
-            g = np.where(self.sign_bits, -g, g)
-        delta_k = np.sign(g).astype(np.int16)
-        self.k_data = np.clip(
-            self.k_data.astype(np.int16) - delta_k, 0, 31
-        ).astype(np.uint8)
+        """STE discrete update: k −= sign(lr · grad), saturating [0, 31].
+        Same rule as cw_fiver_ste_update in compact_weights.cu."""
+        delta_k = np.sign(self._grad_k * lr).astype(np.int16)
+        self.k_data = np.clip(self.k_data.astype(np.int16) - delta_k, 0, 31).astype(np.uint8)
         self.bias -= lr * self._grad_bias
         self._grad_k[:]    = 0.0
         self._grad_bias[:] = 0.0

@@ -1,138 +1,176 @@
 """
-fiver_core.py — Core Fiver quantization/dequantization for external weight tensors.
+fiver_core.py — Fiver 5-bit quantisation for external weight tensors.
 
-Extends fiver.py with:
-  - float_to_fiver(): quantize arbitrary float tensors → Fiver k-values + scale + sign
-  - fiver_reconstruct(): inverse
-  - per-tensor scale to handle any value range (not just [0,2])
+Code k ∈ [0..31].  Two value grids (identical to compact_weights.cu):
 
-Fiver encoding: k ∈ [0..31], w(k) = 1 ± 2^(-k/4) ∈ [0.0 .. 2.0]
-With per-tensor scale s: stored_value = s * w(k) * sign_factor
+  centered (default, zero-centred weights — every LLM weight matrix):
+      v(k) = −2^(−k/4) for k < 16,   v(16) = 0,   v(k) = +2^(−(31−k)/4) for k > 16
+      Sign is the MSB of k; no sign bits.  Dense around 0 like the weights.
+  anchored (original Fiver, positive values clustered near 1, e.g. RMSNorm γ):
+      w(k) = 1 − 2^(−k/4) for k < 16,   1 + 2^(−(31−k)/4) for k ≥ 16
+
+Tensor value:  x[r, c] ≈ scale[r] · v(k[r, c])   — one float scale per row
+(row = all leading dimensions, columns = last dimension; 1-D = one row).
+
+Packed storage: 6 codes per little-endian uint32 (bits 0-29, 30-31 reserved),
+rows padded to a multiple of 6 with the grid's zero code (16 / 0).
+5.333 bits/weight + 32 bits per row.
 """
 import sys
+
 import numpy as np
 
-# Pre-compute all 32 Fiver values once
-_DELTA_LUT = np.array([2.0 ** (-m / 4.0) for m in range(16)], dtype=np.float64)
-_K_TO_W = np.empty(32, dtype=np.float64)
-for _k in range(32):
-    _dir = (_k >> 4) & 1
-    _mag = (31 - _k) if _dir else _k
-    _K_TO_W[_k] = 1.0 + (_DELTA_LUT[_mag] if _dir else -_DELTA_LUT[_mag])
+_DELTA = 2.0 ** (-np.arange(16) / 4.0)
 
-FIVER_VALUES = _K_TO_W.astype(np.float32)  # public, shape (32,)
+ANCHORED = np.r_[1.0 - _DELTA, (1.0 + _DELTA)[::-1]]       # ascending in k
+CENTERED = ANCHORED - 1.0
+CENTERED[16] = 0.0
+
+GRIDS     = {"centered": CENTERED, "anchored": ANCHORED}
+ZERO_CODE = {"centered": 16, "anchored": 0}
+WEIGHTS_PER_WORD = 6
 
 
-def float_to_fiver(
-    x: np.ndarray,
-    use_sign: bool = True,
-) -> dict:
+def candidate_grids(x: np.ndarray) -> list[str]:
+    """Grids worth trying: anchored only for tensors clustered at a positive value."""
+    x = np.asarray(x, dtype=np.float64)
+    return ["centered", "anchored"] if x.size and x.mean() > x.std() else ["centered"]
+
+
+def _as_rows(a: np.ndarray) -> np.ndarray:
+    return a.reshape(1, -1) if a.ndim <= 1 else a.reshape(-1, a.shape[-1])
+
+
+def _nearest_codes(xn: np.ndarray, V: np.ndarray) -> np.ndarray:
+    mid = (V[1:] + V[:-1]) / 2.0
+    return np.searchsorted(mid, xn).astype(np.uint8)
+
+
+def float_to_fiver(x: np.ndarray, grid: str = "auto", n_scales: int = 48,
+                   chunk_rows: int = 4096, quiet: bool = False) -> dict:
     """
-    Quantize a float32/float16 tensor to Fiver 5-bit representation.
+    Quantise a float tensor to Fiver codes with one MSE-optimal scale per row.
 
-    Parameters
-    ----------
-    x         : input weight tensor, any shape
-    use_sign  : if True, handle negative values via sign_bits;
-                if False, clamp negatives to 0.0 (unsigned-only layers)
+    The scale is searched over n_scales geometric steps between 2 % and 100 %
+    of max|row| / max|v| (choosing the max alone wastes most codes on
+    outliers — measured 3–10× worse on SmolLM-135M).
 
-    Returns dict with keys:
-      'k_data'    : uint8 ndarray, same shape as x, values in [0..31]
-      'scale'     : float32 scalar — multiply Fiver values by this to recover x
-      'sign_bits' : uint8 ndarray (0=pos, 1=neg), same shape, or None if use_sign=False
-      'shape'     : original shape tuple
-      'dtype'     : original dtype
+    grid="auto" quantises with every candidate grid and keeps the one with the
+    lower error (anchored clips the few negatives such tensors may contain).
+
+    Returns dict: k_data (uint8, x.shape), scale (float32, rows),
+                  grid (str), shape (tuple).
     """
-    orig_shape = x.shape
-    orig_dtype = x.dtype
-    x = x.astype(np.float64).ravel()
+    if grid == "auto":
+        qs = [float_to_fiver(x, g, n_scales, chunk_rows, quiet=True) for g in candidate_grids(x)]
+        return min(qs, key=lambda q: quantization_error(x, q)["rel_rmse"])
+    if grid not in GRIDS:
+        raise ValueError(f"grid must be 'auto', 'centered' or 'anchored', got {grid!r}")
+    V = GRIDS[grid]
+    shape = tuple(x.shape)
+    X = _as_rows(np.asarray(x, dtype=np.float64))
+    if grid == "anchored" and X.size and X.min() < 0:
+        if not quiet:
+            print(f"[fiver_core] WARNING: anchored grid clips {int((X < 0).sum())} negative values to 0",
+                  file=sys.stderr)
+        X = np.maximum(X, 0.0)
 
-    if use_sign:
-        sign_bits = (x < 0).astype(np.uint8)
-        x_abs = np.abs(x)
-    else:
-        sign_bits = None
-        x_abs = np.clip(x, 0.0, np.inf)
+    rows = X.shape[0]
+    k_out = np.empty(X.shape, dtype=np.uint8)
+    s_out = np.zeros(rows, dtype=np.float32)
+    t_grid = np.geomspace(0.02, 1.0, n_scales)
 
-    # Per-tensor scale: map max |x| → 2.0 (top of Fiver range)
-    x_max = x_abs.max()
-    if x_max < 1e-12:
-        # Zero or near-zero tensor — return all k=15 (w≈0.926, near 1.0 center)
-        k_data = np.full(x.shape, 15, dtype=np.uint8)
-        return {
-            'k_data': k_data.reshape(orig_shape),
-            'scale': np.float32(0.0),
-            'sign_bits': (sign_bits.reshape(orig_shape) if sign_bits is not None else None),
-            'shape': orig_shape,
-            'dtype': orig_dtype,
-        }
+    for r0 in range(0, rows, chunk_rows):
+        Xc   = X[r0:r0 + chunk_rows]
+        base = np.abs(Xc).max(axis=1) / np.abs(V).max()
+        best_e = np.full(len(Xc), np.inf)
+        best_k = np.full(Xc.shape, ZERO_CODE[grid], dtype=np.uint8)
+        best_s = np.zeros(len(Xc))
+        for t in t_grid:
+            s  = base * t
+            xn = np.divide(Xc, s[:, None], out=np.zeros_like(Xc), where=s[:, None] > 0)
+            k  = _nearest_codes(xn, V)
+            e  = ((Xc - V[k] * s[:, None]) ** 2).sum(axis=1)
+            better = (e < best_e) & (s > 0)
+            best_e[better] = e[better]
+            best_k[better] = k[better]
+            best_s[better] = s[better]
+        k_out[r0:r0 + chunk_rows] = best_k
+        s_out[r0:r0 + chunk_rows] = best_s
 
-    scale = np.float32(x_max / 2.0)
-    x_norm = np.clip(x_abs / float(scale), 0.0, 2.0)  # normalized to [0, 2]
-
-    # Vectorized nearest-neighbor search in FIVER_VALUES
-    # dists: (N, 32) — find argmin along axis=1
-    dists = np.abs(x_norm[:, np.newaxis] - FIVER_VALUES[np.newaxis, :].astype(np.float64))
-    k_data = np.argmin(dists, axis=1).astype(np.uint8)
-
-    return {
-        'k_data':    k_data.reshape(orig_shape),
-        'scale':     scale,
-        'sign_bits': (sign_bits.reshape(orig_shape) if sign_bits is not None else None),
-        'shape':     orig_shape,
-        'dtype':     orig_dtype,
-    }
+    return {"k_data": k_out.reshape(shape), "scale": s_out, "grid": grid, "shape": shape}
 
 
 def fiver_reconstruct(q: dict) -> np.ndarray:
-    """
-    Reconstruct float32 tensor from Fiver quantization dict (output of float_to_fiver).
-    """
-    k   = q['k_data'].astype(np.uint8).ravel()
-    w   = FIVER_VALUES[k].astype(np.float64)
-    w  *= float(q['scale'])
-    if q['sign_bits'] is not None:
-        sign_factor = np.where(q['sign_bits'].ravel(), -1.0, 1.0)
-        w *= sign_factor
-    return w.reshape(q['shape']).astype(np.float32)
+    """Inverse of float_to_fiver → float32 tensor."""
+    V = GRIDS[str(q["grid"])]
+    k = _as_rows(np.asarray(q["k_data"]))
+    return (V[k] * np.asarray(q["scale"], dtype=np.float64)[:, None]).reshape(q["shape"]).astype(np.float32)
+
+
+def bits_per_weight(shape: tuple) -> float:
+    cols = int(shape[-1]) if len(shape) else 1
+    rows = int(np.prod(shape)) // max(cols, 1)
+    wpr  = -(-cols // WEIGHTS_PER_WORD)
+    return (rows * wpr * 32 + rows * 32) / max(rows * cols, 1)
 
 
 def quantization_error(original: np.ndarray, q: dict) -> dict:
-    """Compute reconstruction error metrics between original and quantized tensor."""
-    recon = fiver_reconstruct(q)
-    orig_f = original.astype(np.float32)
-    diff   = orig_f - recon
-
-    rel_err = np.abs(diff) / (np.abs(orig_f) + 1e-8)
-
-    # KL divergence between normalized histograms (32 bins)
-    bins = 32
-    orig_hist, edges = np.histogram(orig_f.ravel(), bins=bins, density=True)
-    rec_hist,  _     = np.histogram(recon.ravel(),  bins=edges, density=True)
-    eps = 1e-10
-    orig_hist = orig_hist + eps
-    rec_hist  = rec_hist  + eps
-    orig_hist /= orig_hist.sum()
-    rec_hist  /= rec_hist.sum()
-    kl = float(np.sum(orig_hist * np.log(orig_hist / rec_hist)))
-
+    """Reconstruction error metrics between original and quantised tensor."""
+    o = np.asarray(original, dtype=np.float64)
+    r = fiver_reconstruct(q).astype(np.float64)
+    diff = o - r
+    rel  = float(np.sqrt((diff ** 2).sum() / max((o ** 2).sum(), 1e-30)))
+    bpw  = bits_per_weight(q["shape"])
     return {
-        'l2_norm':       float(np.sqrt((diff**2).mean())),
-        'max_abs_err':   float(np.abs(diff).max()),
-        'mean_rel_err':  float(rel_err.mean()),
-        'kl_divergence': kl,
-        'bits_original': original.astype(np.float32).nbytes * 8,
-        'bits_fiver':    q['k_data'].size * 5,  # 5 bits per k value
-        'compression':   original.astype(np.float32).nbytes / max(q['k_data'].size * 5 / 8, 1),
+        "rel_rmse":     rel,
+        "sqnr_db":      float(-20 * np.log10(max(rel, 1e-12))),
+        "max_abs_err":  float(np.abs(diff).max()) if diff.size else 0.0,
+        "bpw":          bpw,
+        "compression":  32.0 / bpw,
     }
 
 
-def memory_summary(name: str, shape: tuple, dtype, scale: float) -> str:
+def memory_summary(name: str, shape: tuple, grid: str) -> str:
     """One-line memory comparison string."""
-    n      = int(np.prod(shape))
-    fp32   = n * 4
-    fp16   = n * 2
-    fiver5 = n * 5 // 8
-    return (f"  {name:40s}  shape={str(shape):20s}"
-            f"  FP32={fp32/1e6:.1f}MB  FP16={fp16/1e6:.1f}MB"
-            f"  Fiver5={fiver5/1e6:.1f}MB  scale={scale:.4f}")
+    n   = int(np.prod(shape))
+    bpw = bits_per_weight(shape)
+    return (f"  {name:48s}  shape={str(tuple(shape)):18s} grid={grid:8s}"
+            f"  FP32={n * 4 / 1e6:8.2f}MB  FP16={n * 2 / 1e6:8.2f}MB"
+            f"  Fiver={n * bpw / 8 / 1e6:7.2f}MB ({bpw:.3f} bpw)")
+
+
+def pack_fiver(k_data: np.ndarray, grid: str) -> bytes:
+    """Row-padded little-endian uint32 words, 6 codes each (k_i at bits 5i)."""
+    k = _as_rows(np.asarray(k_data)).astype(np.uint32)
+    pad = (-k.shape[1]) % WEIGHTS_PER_WORD
+    if pad:
+        k = np.pad(k, ((0, 0), (0, pad)), constant_values=ZERO_CODE[grid])
+    k6 = k.reshape(k.shape[0], -1, WEIGHTS_PER_WORD)
+    words = np.zeros(k6.shape[:2], dtype=np.uint32)
+    for i in range(WEIGHTS_PER_WORD):
+        words |= (k6[..., i] & 0x1F) << (5 * i)
+    return words.astype("<u4").tobytes()
+
+
+def unpack_fiver(buf: bytes, shape: tuple) -> np.ndarray:
+    """Inverse of pack_fiver → uint8 codes with `shape`."""
+    cols = int(shape[-1]) if len(shape) else 1
+    rows = int(np.prod(shape)) // max(cols, 1)
+    wpr  = -(-cols // WEIGHTS_PER_WORD)
+    words = np.frombuffer(buf, dtype="<u4", count=rows * wpr).reshape(rows, wpr)
+    k = np.stack([((words >> (5 * i)) & 0x1F).astype(np.uint8) for i in range(WEIGHTS_PER_WORD)],
+                 axis=-1)
+    return k.reshape(rows, wpr * WEIGHTS_PER_WORD)[:, :cols].reshape(shape)
+
+
+def save_npz(path, q: dict) -> None:
+    np.savez_compressed(path, k_data=q["k_data"], scale=np.asarray(q["scale"], np.float32),
+                        grid=np.array(q["grid"]), shape=np.array(q["shape"], dtype=np.int64))
+
+
+def load_npz(path) -> dict:
+    d = np.load(str(path), allow_pickle=False)
+    shape = tuple(int(s) for s in d["shape"]) if "shape" in d else d["k_data"].shape
+    return {"k_data": d["k_data"].reshape(shape), "scale": d["scale"],
+            "grid": str(d["grid"]), "shape": shape}

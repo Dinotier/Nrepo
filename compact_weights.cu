@@ -1,12 +1,24 @@
 /*
- * compact_weights.cu — Symmetric Fiver Weight Format, CUDA Implementation
+ * compact_weights.cu — Fiver 5-bit weight format, CUDA implementation
  *
- * Encoding: k in [0..31], 5-bit unsigned, MSB = direction
- *   k in [ 0..15] (bit4=0): w = 1 - 2^(-k/4)      range [0.0  .. 0.926]
- *   k in [16..31] (bit4=1): w = 1 + 2^(-(31-k)/4)  range [1.074 .. 2.0 ]
+ * Code k ∈ [0..31], 5 bits.  Two value grids share codes, storage and kernels:
  *
- * Values are monotonically increasing with k.
- * Distribution is sigmoid-shaped around 1.0 (dense near center, sparse at extremes).
+ *   CENTERED (default, for zero-centred weights — every weight matrix of an LLM):
+ *     v(k)  = −2^(−k/4)          k =  0..15   (−1.000 … −0.074)
+ *     v(16) =  0
+ *     v(k)  = +2^(−(31−k)/4)     k = 17..31   (+0.088 … +1.000)
+ *     The sign is the MSB of k: no sign bits.  Dense around 0, coarse
+ *     towards ±1 — the shape of the bell-shaped weight distribution.
+ *
+ *   ANCHORED (original Fiver, for positive values clustered near 1):
+ *     w(k)  = 1 − 2^(−k/4)       k =  0..15   (0.000 … 0.926)
+ *     w(k)  = 1 + 2^(−(31−k)/4)  k = 16..31   (1.074 … 2.000)
+ *
+ *   CENTERED = ANCHORED − 1, except that code 16 is exactly 0.
+ *   Both grids are strictly increasing in k, so the STE update is k ∓ 1.
+ *
+ * Weight = row_scale[r] · v(k).  Storage: 6 codes per uint32 (bits 0-29,
+ * bits 30-31 reserved) → 5.333 bits/weight plus one float per row.
  *
  * Toolchain: CUDA 12.x (CUDA 13 removed sm_61 / GTX 1080 Ti).
  *
@@ -45,7 +57,7 @@
 /*
  * ╔══════════════════════════════════════════════════════════════════════╗
  * ║                          DATA  BLOCK                                ║
- * ║  packed word layouts · FiverMatrix · 32-entry LUT · helper macros   ║
+ * ║  word layout · FiverMatrix · value grids · int8 tables · macros     ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  */
 
@@ -58,19 +70,16 @@
  * Full bits 0x3FB504F3 = sign(0) | exp(127) | mantissa(0x3504F3) */
 #define CW_SQRT2_BITS        0x3FB504F3U
 
-/* sqrt(2) approximations — fixed known deviation, no refinement ever.
- * Choice depends on whether over- or under-estimation is preferred. */
+/* sqrt(2) approximations — fixed known deviation, no refinement ever. */
 #define CW_SQRT2_HIGH        1.5f         /* error +6.07% */
 #define CW_SQRT2_LOW         1.35f        /* error -4.54% */
 #define CW_SQRT2_ERROR_HIGH  0.0607f
 #define CW_SQRT2_ERROR_LOW   0.0454f
 
-/* Fiver value boundaries */
-#define CW_FIVER_MAX         31u
-#define CW_FIVER_CENTER_LO   15u          /* w ≈ 0.926, finest step below 1.0 */
-#define CW_FIVER_CENTER_HI   16u          /* w ≈ 1.074, finest step above 1.0 */
+#define CW_GRID_CENTERED     0
+#define CW_GRID_ANCHORED     1
 
-/* Optional field flags */
+#define CW_K_MAX             31u
 #define CW_FLAG_HAS_ACT      (1u << 1)
 
 /* Activation codes (2 bits per weight in act_bits) */
@@ -83,104 +92,103 @@
 #define CW_WEIGHTS_PER_WORD  6u
 
 /*
- * Packed storage: one uint32 word = 6 consecutive weights of one row,
- * plus two sign bits (S_lo for k0..k2, S_hi for k3..k5).  5.333 bpw.
+ * Packed storage: one uint32 word = 6 consecutive codes of one row.
  *
- * Both layouts carry the same information; only the bit positions differ.
- * They are byte-identical to what emoji_net/fiver_quant/fiver_gguf.py writes.
+ *   ┌────┬────┬───────┬───────┬───────┬───────┬───────┬───────┐
+ *   │ r  │ r  │  k5   │  k4   │  k3   │  k2   │  k1   │  k0   │
+ *   │ 31 │ 30 │ 29-25 │ 24-20 │ 19-15 │ 14-10 │  9-5  │  4-0  │
+ *   └────┴────┴───────┴───────┴───────┴───────┴───────┴───────┘
+ *   r = reserved (0).  Byte-identical to emoji_net/fiver_quant/fiver_gguf.py.
  *
- *   CW_LAYOUT_U16  — two little-endian uint16 triplets read as one uint32
- *     ┌──────┬─────┬─────┬─────┬──────┬─────┬─────┬─────┐
- *     │S_hi  │ k5  │ k4  │ k3  │S_lo  │ k2  │ k1  │ k0  │
- *     │ 31   │30-26│25-21│20-16│ 15   │14-10│ 9-5 │ 4-0 │
- *     └──────┴─────┴─────┴─────┴──────┴─────┴─────┴─────┘
- *
- *   CW_LAYOUT_U32  — sextet with the 2-bit sign code on top
- *     ┌──────┬──────┬─────┬─────┬─────┬─────┬─────┬─────┐
- *     │S_lo  │S_hi  │ k5  │ k4  │ k3  │ k2  │ k1  │ k0  │
- *     │ 31   │ 30   │29-25│24-20│19-15│14-10│ 9-5 │ 4-0 │
- *     └──────┴──────┴─────┴─────┴─────┴─────┴─────┴─────┘
- *     (S_lo S_hi) = 00 all+, 11 all−, 10 −−−+++, 01 +++−−−
- *
- * Rows are padded to a multiple of 6 weights with k=0, sign=0.  Since
- * w(0) = 0.0 exactly, padding contributes nothing to any dot product.
+ * Rows are padded to a multiple of 6 with the grid's zero code
+ * (16 centered, 0 anchored), so padding never contributes to a product.
  * Row r starts at word r * words_per_row,  words_per_row = ceil(cols / 6).
  */
-#define CW_LAYOUT_U16  0
-#define CW_LAYOUT_U32  1
-
 __host__ __device__ __forceinline__
-uint32_t cw_k_shift(int layout, int i) {
-    return (uint32_t)(5 * i + ((layout == CW_LAYOUT_U16 && i >= 3) ? 1 : 0));
-}
-
-__host__ __device__ __forceinline__
-uint32_t cw_sign_shift(int layout, int i) {
-    if (layout == CW_LAYOUT_U16) return i < 3 ? 15u : 31u;
-    return i < 3 ? 31u : 30u;
-}
+uint32_t cw_k_at(uint32_t word, int i) { return (word >> (5 * i)) & 0x1Fu; }
 
 static inline uint32_t cw_words_per_row(uint32_t cols) {
     return (cols + CW_WEIGHTS_PER_WORD - 1u) / CW_WEIGHTS_PER_WORD;
 }
 
+static inline uint32_t cw_pad_k(int grid) { return grid == CW_GRID_CENTERED ? 16u : 0u; }
+
+static inline uint32_t cw_pack_word(const uint8_t k[6]) {
+    uint32_t w = 0;
+    for (int i = 0; i < 6; i++) w |= ((uint32_t)k[i] & 0x1Fu) << (5 * i);
+    return w;
+}
+
+static inline uint32_t cw_pad_word(int grid) {
+    uint8_t k[6];
+    for (int i = 0; i < 6; i++) k[i] = (uint8_t)cw_pad_k(grid);
+    return cw_pack_word(k);
+}
+
 /*
  * FiverMatrix — device-resident packed weight matrix (rows × cols).
- * Weights stay packed in VRAM; they are decoded in registers inside the
- * GEMV kernel and never written back as floats.
+ * Weights stay packed in VRAM; kernels decode them in registers and never
+ * write them back as floats.  The STE update rewrites words in place.
  */
 typedef struct {
-    uint32_t*       words;      /* [rows * words_per_row]; updated in place     */
+    uint32_t*       words;      /* [rows * words_per_row]                       */
+    const float*    row_scale;  /* [rows], ≥ 0:  W[r,c] = row_scale[r]·v(k)      */
     const uint32_t* act_bits;   /* optional: 2 bits/weight over padded columns  */
     uint32_t rows;
     uint32_t cols;
     uint32_t words_per_row;
-    float    scale;             /* per-tensor: y = scale * (W · x)              */
-    int      layout;            /* CW_LAYOUT_U16 | CW_LAYOUT_U32                */
+    int      grid;              /* CW_GRID_CENTERED | CW_GRID_ANCHORED          */
     uint8_t  flags;             /* CW_FLAG_HAS_ACT                              */
 } FiverMatrix;
 
 /*
- * 32-entry value LUT:  cw_fiver_lut[k] = w(k).
+ * Value LUT per grid:  cw_grid_lut[grid][k] = v(k).
  *
  * Each lane of a warp loads exactly one entry (lane == k) into a register
  * once per kernel.  Decoding is then a register shuffle:
- *     w = __shfl_sync(full, lut_reg, k)
- * 32 Fiver values == 32 lanes, so no memory access happens in the hot loop
- * and differing k across lanes costs nothing extra.  (A __constant__ lookup
- * with per-lane different addresses would serialise up to 32-way.)
+ *     v = __shfl_sync(full, lut_reg, k)
+ * 32 codes == 32 lanes: no memory access in the hot loop, and differing k
+ * across lanes costs nothing extra.  Changing the grid only changes these
+ * 32 numbers — the kernels are grid-agnostic.
  */
-__constant__ float cw_fiver_lut[32] = {
-    0.00000000f, 0.15910358f, 0.29289322f, 0.40539644f,
-    0.50000000f, 0.57955179f, 0.64644661f, 0.70269822f,
-    0.75000000f, 0.78977590f, 0.82322330f, 0.85134911f,
-    0.87500000f, 0.89488795f, 0.91161165f, 0.92567456f,
-    1.07432544f, 1.08838835f, 1.10511205f, 1.12500000f,
-    1.14865089f, 1.17677670f, 1.21022410f, 1.25000000f,
-    1.29730178f, 1.35355339f, 1.42044821f, 1.50000000f,
-    1.59460356f, 1.70710678f, 1.84089642f, 2.00000000f
+__constant__ float cw_grid_lut[2][32] = {
+    {   /* CENTERED */
+        -1.00000000f, -0.84089642f, -0.70710678f, -0.59460356f,
+        -0.50000000f, -0.42044821f, -0.35355339f, -0.29730178f,
+        -0.25000000f, -0.21022410f, -0.17677670f, -0.14865089f,
+        -0.12500000f, -0.10511205f, -0.08838835f, -0.07432544f,
+        +0.00000000f, +0.08838835f, +0.10511205f, +0.12500000f,
+        +0.14865089f, +0.17677670f, +0.21022410f, +0.25000000f,
+        +0.29730178f, +0.35355339f, +0.42044821f, +0.50000000f,
+        +0.59460356f, +0.70710678f, +0.84089642f, +1.00000000f
+    },
+    {   /* ANCHORED */
+        +0.00000000f, +0.15910358f, +0.29289322f, +0.40539644f,
+        +0.50000000f, +0.57955179f, +0.64644661f, +0.70269822f,
+        +0.75000000f, +0.78977590f, +0.82322330f, +0.85134911f,
+        +0.87500000f, +0.89488795f, +0.91161165f, +0.92567456f,
+        +1.07432544f, +1.08838835f, +1.10511205f, +1.12500000f,
+        +1.14865089f, +1.17677670f, +1.21022410f, +1.25000000f,
+        +1.29730178f, +1.35355339f, +1.42044821f, +1.50000000f,
+        +1.59460356f, +1.70710678f, +1.84089642f, +2.00000000f
+    }
 };
 
 /*
- * int8 LUT for the INT8 path (w = 1 + d):  cw_e_lut[k] = rn(127 · (w(k) − 1)).
- * All 32 values stay distinct; rounding error ≤ 0.5/127 ≈ 0.0039 in w units.
- * (int8 of w itself would need scale 63.5 and lose ~1.75× as much.)
- * Antisymmetric: e(31 − k) = −e(k).  Decoded with the same lane shuffle.
+ * int8 tables for the INT8 path:  v(k) ≈ offset + e(k)/127
+ *   CENTERED: offset 0, e = rn(127·v)        — a plain int8 dot product
+ *   ANCHORED: offset 1, e = rn(127·(w − 1))  — plus 127·Σx per input row
+ * All 32 values stay distinct; rounding error ≤ 0.5/127 ≈ 0.0039.
+ * The two tables differ only at k = 16 (0 vs 9).
  */
-__constant__ int cw_e_lut[32] = {
-    -127, -107, -90, -76, -64, -53, -45, -38,
-     -32,  -27, -22, -19, -16, -13, -11,  -9,
-       9,   11,  13,  16,  19,  22,  27,  32,
-      38,   45,  53,  64,  76,  90, 107, 127
-};
-static const int cw_e_lut_cpu[32] = {
-    -127, -107, -90, -76, -64, -53, -45, -38,
-     -32,  -27, -22, -19, -16, -13, -11,  -9,
-       9,   11,  13,  16,  19,  22,  27,  32,
-      38,   45,  53,  64,  76,  90, 107, 127
+__constant__ int cw_grid_e[2][32] = {
+    { -127, -107, -90, -76, -64, -53, -45, -38, -32, -27, -22, -19, -16, -13, -11,  -9,
+         0,   11,  13,  16,  19,  22,  27,  32,  38,  45,  53,  64,  76,  90, 107, 127 },
+    { -127, -107, -90, -76, -64, -53, -45, -38, -32, -27, -22, -19, -16, -13, -11,  -9,
+         9,   11,  13,  16,  19,  22,  27,  32,  38,  45,  53,  64,  76,  90, 107, 127 }
 };
 
-/* Host-side reference: delta_lut[m] = 2^(-m/4), m = 0..15 */
+/* Host-side reference: delta_lut[m] = 2^(-m/4), m = 0..15 (independent of the GPU tables) */
 static const float cw_delta_lut_cpu[16] = {
     1.00000000f, 0.84089642f, 0.70710678f, 0.59460354f,
     0.50000000f, 0.42044821f, 0.35355339f, 0.29730178f,
@@ -196,10 +204,10 @@ static const float cw_delta_lut_cpu[16] = {
 #define CW_DEC_K_WRAP(k) ((uint8_t)(((k) - 1u) & 0x1Fu))
 
 /*
- * TODO: 5→6 bit extension via "2→4 trick"
- *   Bit[5] acts as a second scaling stage: delta becomes delta/4.
- *   Math: 2^(-mag/4) → 2^(-mag/4 - 2).
- *   64 distinct values — would need a 64-entry LUT (two shuffles per lookup).
+ * Option kept open: 6-bit codes (magnitude 0..31, bit 5 = δ/16 = exponent − 4)
+ * give 64 distinct values and contain all 5-bit values; 5 codes per uint32
+ * (6.4 bits/weight).  Measured gain: large for ANCHORED near-1 tensors, ~3%
+ * for CENTERED projection weights.  The δ/4 variant yields only 48 values.
  */
 
 /*
@@ -210,8 +218,8 @@ static const float cw_delta_lut_cpu[16] = {
  * monotone ordering in weight space, making gradient-based k-updates undefined
  * across the boundary and preventing vector-space comparisons.
  *
- * Reconnect point: repack legacy data into FiverMatrix words on the host and
- * use cw_fiver_gemv unchanged.  Math equivalence:
+ * Reconnect point: repack legacy data into FiverMatrix words (ANCHORED grid)
+ * on the host and use the kernels unchanged.  Math equivalence:
  *   legacy n in [0..15], formula_bit=0 (subtract)  ==  Fiver k = n
  *   legacy n in [0..15], formula_bit=1 (add)        ==  Fiver k = (31 - n)
  *
@@ -229,7 +237,7 @@ static const float cw_delta_lut_cpu[16] = {
 /*
  * ╔══════════════════════════════════════════════════════════════════════╗
  * ║                         KERNEL  BLOCK                               ║
- * ║  cw_quake_rsqrt · cw_hw_rsqrt · cw_apply_act · cw_fiver_gemv        ║
+ * ║  rsqrt · activations · forward (float / dp4a / TC) · backward       ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  */
 
@@ -261,8 +269,9 @@ float cw_hw_rsqrt(float x) {
 }
 
 /*
- * Activation on the decoded (signed, unscaled) Fiver weight.
- * Callers should group weights by activation type to avoid warp divergence.
+ * Activation on the decoded, unscaled weight v(k).
+ * All four are odd and increasing, so they never change the sign of an
+ * STE gradient.  Callers should group weights by activation type.
  */
 __host__ __device__ __forceinline__
 float cw_apply_act(float x, uint32_t code) {
@@ -278,46 +287,50 @@ float cw_apply_act(float x, uint32_t code) {
     }
 }
 
-/* Host reference decode (formula path, independent of cw_fiver_lut). */
-static inline float cw_fiver_to_float_cpu(uint8_t k) {
-    uint32_t dir   = (uint32_t)(k >> 4u) & 1u;
-    uint32_t mag   = dir ? (31u - (uint32_t)k) : (uint32_t)k;
-    float    delta = cw_delta_lut_cpu[mag];
-    return 1.0f + (dir ? +delta : -delta);
+/* Host reference value (formula path, independent of cw_grid_lut). */
+static inline float cw_value_cpu(int grid, uint32_t k) {
+    const uint32_t dir = (k >> 4) & 1u;
+    const float    d   = cw_delta_lut_cpu[dir ? 31u - k : k];
+    if (grid == CW_GRID_ANCHORED) return dir ? 1.0f + d : 1.0f - d;
+    if (k == 16u) return 0.0f;
+    return dir ? d : -d;
+}
+
+/* Host reference int8 code (formula path, independent of cw_grid_e). */
+static inline int cw_e_cpu(int grid, uint32_t k) {
+    const float off = grid == CW_GRID_ANCHORED ? 1.0f : 0.0f;
+    return (int)lrintf(127.0f * (cw_value_cpu(grid, k) - off));
 }
 
 /*
- * Fused Fiver GEMV:  Y[b, r] = scale · Σ_c W[r, c] · X[b, c]
+ * Fused Fiver GEMV:  Y[b, r] = row_scale[r] · Σ_c v(k[r, c]) · X[b, c]
  *
  * One warp per output row.  Each lane loads one uint32 word per iteration
  * (a warp reads 128 contiguous bytes = 192 weights, fully coalesced),
- * decodes its 6 weights with register shuffles and FMAs them against X.
- * Weights are never materialised: VRAM traffic for W is 5.333 bits/weight.
+ * decodes its 6 codes with register shuffles and FMAs them against X.
+ * VRAM traffic for W is 5.333 bits/weight; no float weights exist.
  *
- * BT batch rows share each decoded word (weights stay in registers);
- * gridDim.y = ceil(batch / BT).
+ * BT batch rows share each decoded word; gridDim.y = ceil(batch / BT).
+ * The loop trip count is the same for all lanes of a warp, so the
+ * full-mask shuffles always run convergently; lanes past the end of the
+ * row decode a dummy word and skip the FMA.
  *
- * The loop trip count is identical for all lanes of a warp, so the
- * full-mask __shfl_sync calls are always executed convergently.  Lanes past
- * the end of the row decode word 0 (all k=0 → w=0) and skip the FMA.
- *
- * Grid:  gridDim.x = ceil(rows / warps_per_block), blockDim.x = 32·warps
- * GPU support: sm_61 (GTX 1080 Ti) and newer — plain FP32 FMA path,
- * no Tensor Cores and no FP16 arithmetic required.
+ * GPU support: sm_61 (GTX 1080 Ti) and newer — plain FP32 FMA path.
  */
-template <int LAYOUT, int BT>
+template <int BT>
 __global__ void cw_fiver_gemv(
     const uint32_t* __restrict__ W,
+    const float*    __restrict__ row_scale,
     const uint32_t* __restrict__ act_bits,
     const float*    __restrict__ X,
     float*          __restrict__ Y,
     uint32_t rows, uint32_t cols, uint32_t words_per_row,
-    uint32_t batch, float scale, uint8_t flags)
+    uint32_t batch, int grid, uint8_t flags)
 {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row  = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const uint32_t b0   = blockIdx.y * (uint32_t)BT;
-    const float    lut  = cw_fiver_lut[lane];
+    const float    lut  = cw_grid_lut[grid][lane];
 
     if (row >= rows) return;   /* uniform per warp */
 
@@ -335,12 +348,8 @@ __global__ void cw_fiver_gemv(
 
         float w[CW_WEIGHTS_PER_WORD];
 #pragma unroll
-        for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++) {
-            const uint32_t k = (word >> cw_k_shift(LAYOUT, i)) & 0x1Fu;
-            const uint32_t s = (word >> cw_sign_shift(LAYOUT, i)) & 1u;
-            const float    v = __shfl_sync(CW_FULL_MASK, lut, (int)k);
-            w[i] = __int_as_float(__float_as_int(v) ^ (int)(s << 31));
-        }
+        for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++)
+            w[i] = __shfl_sync(CW_FULL_MASK, lut, (int)cw_k_at(word, i));
 
         if (!valid) continue;
 
@@ -373,29 +382,24 @@ __global__ void cw_fiver_gemv(
     }
 
     if (lane == 0) {
+        const float s = __ldg(&row_scale[row]);
 #pragma unroll
         for (int b = 0; b < BT; b++)
-            if (b0 + b < batch) Y[(size_t)(b0 + b) * rows + row] = acc[b] * scale;
+            if (b0 + b < batch) Y[(size_t)(b0 + b) * rows + row] = acc[b] * s;
     }
 }
 
 #define CW_GEMV_WARPS  4
 #define CW_GEMV_BT     4
 
-/* Host launcher: picks the layout specialisation. */
 static void cw_fiver_gemv_launch(const FiverMatrix* m, const float* d_x, float* d_y,
                                  uint32_t batch, cudaStream_t stream) {
     dim3 block(32u * CW_GEMV_WARPS);
     dim3 grid((m->rows + CW_GEMV_WARPS - 1u) / CW_GEMV_WARPS,
               (batch + CW_GEMV_BT - 1u) / CW_GEMV_BT);
-    if (m->layout == CW_LAYOUT_U32)
-        cw_fiver_gemv<CW_LAYOUT_U32, CW_GEMV_BT><<<grid, block, 0, stream>>>(
-            m->words, m->act_bits, d_x, d_y, m->rows, m->cols, m->words_per_row,
-            batch, m->scale, m->flags);
-    else
-        cw_fiver_gemv<CW_LAYOUT_U16, CW_GEMV_BT><<<grid, block, 0, stream>>>(
-            m->words, m->act_bits, d_x, d_y, m->rows, m->cols, m->words_per_row,
-            batch, m->scale, m->flags);
+    cw_fiver_gemv<CW_GEMV_BT><<<grid, block, 0, stream>>>(
+        m->words, m->row_scale, m->act_bits, d_x, d_y, m->rows, m->cols, m->words_per_row,
+        batch, m->grid, m->flags);
 }
 
 /* FP32 reference GEMV with identical structure — baseline for the benchmark. */
@@ -433,41 +437,34 @@ __global__ void cw_f32_gemv(const float* __restrict__ W, const float* __restrict
             if (b0 + b < batch) Y[(size_t)(b0 + b) * rows + row] = acc[b];
 }
 
-/* Decode probe: lane k writes w(k) via the shuffle path (tests the LUT). */
-__global__ void cw_lut_probe(float* out) {
-    const float lut = cw_fiver_lut[threadIdx.x & 31u];
-    out[threadIdx.x] = __shfl_sync(CW_FULL_MASK, lut, (int)(threadIdx.x & 31u));
+/* Decode probe: lane k writes v(k) and e(k) via the shuffle path (tests both LUTs). */
+__global__ void cw_lut_probe(float* out_v, int* out_e, int grid) {
+    const int   lane = (int)(threadIdx.x & 31u);
+    const float lut  = cw_grid_lut[grid][lane];
+    const int   elut = cw_grid_e[grid][lane];
+    out_v[lane] = __shfl_sync(CW_FULL_MASK, lut, lane);
+    out_e[lane] = __shfl_sync(CW_FULL_MASK, elut, lane);
 }
 
 
 /*
  * ┌──────────────────────────────────────────────────────────────────────┐
- * │  INT8 PATH — decomposition around the Fiver anchor 1.0               │
+ * │  INT8 PATH                                                           │
  * └──────────────────────────────────────────────────────────────────────┘
  *
- *   w = σ · (1 + d),   d = w(k) − 1 ∈ [−1, 1],   σ = shared sign of a triplet
+ *   v(k) ≈ offset + e(k)/127,   x ≈ sx · xq   (per input row, sx = max|x|/127)
  *
- *   y_r = s · Σ_c σ_c (1 + d_c) x_c
- *       = s · [ Σ_t σ_t · X3_t      +      Σ_c σ_c · d_c · x_c ]
- *               └ triplet sums ┘           └── int8 GEMM ───┘
+ *   y[b,r] ≈ row_scale[r] · sx[b] / 127 · ( Σ_c e[r,c] · xq[b,c]  +  offset · 127 · Σ_c xq[b,c] )
+ *                                           └──── int8 dot ────┘      └ one int per input row ┘
  *
- *   X3_t = x_3t + x_3t+1 + x_3t+2 is computed once per input row and shared
- *   by every output row.  For unsigned layers (σ ≡ +1) the first term is Σx.
+ * CENTERED: offset = 0 — a plain int8 dot product.
+ * ANCHORED: offset = 1 — Σxq is computed once per input row while quantising.
+ * The integer part is exact; only x and v are rounded.
+ *   __dp4a:       2 instructions per word (codes packed as two triplets).
+ *   Tensor Cores: one WMMA s8 MMA per 16-column step.
  *
- * Quantisation (per input row b):  sx = max|x| / 127,  xq = rn(x / sx)
- *                                  e  = cw_e_lut[k]  = rn(127 · d)
- *
- *   y_r ≈ s · sx / 127 · Σ_t σ_t · ( 127 · X3q_t  +  Σ_{i∈t} e_i · xq_i )
- *
- * The sum is exact int32 arithmetic.
- *   __dp4a:       one instruction per triplet, the 127·X3q term rides on the
- *                 accumulator input:   v_t = __dp4a(E_t, Xq_t, 127·X3q_t),
- *                 the shared sign is a conditional negate of v_t.
- *   Tensor Cores: C = 127 · (A1 · Xq) + A2 · Xq  with A1 = σ (±1), A2 = σ·e,
- *                 both MMAs reuse the same Xq fragments.
- *
- * int32 range: |v_t| ≤ 3·127² + 127·381 = 96774  →  cols ≤ 65536 is safe.
- * Per-weight activations (CW_FLAG_HAS_ACT) break the decomposition; the
+ * int32 range: |e·xq| ≤ 127², so cols ≤ 65536 never overflows.
+ * Per-weight activations (CW_FLAG_HAS_ACT) cannot be expressed this way; the
  * INT8 path refuses such matrices — use cw_fiver_gemv for those.
  */
 #define CW_INT8_MAX_COLS     65536u
@@ -478,8 +475,8 @@ __global__ void cw_lut_probe(float* out) {
 typedef struct {
     int8_t*  xq;         /* [batch_pad × ld]  int8; cols padded to 96, batch to 16 */
     int32_t* xq3;        /* [batch × triplets] packed bytes (xq0, xq1, xq2, 0)    */
-    int32_t* c3;         /* [batch × triplets] 127 · (xq0 + xq1 + xq2)            */
     float*   sx;         /* [batch_pad]        max|x| / 127                        */
+    int32_t* sxq;        /* [batch_pad]        Σ_c xq  (offset term, ANCHORED)     */
     uint32_t ld;
     uint32_t batch;
     uint32_t batch_pad;
@@ -495,26 +492,28 @@ static void cw_int8_workspace_alloc(CwInt8Workspace* ws, uint32_t cols, uint32_t
     ws->triplets  = 2u * wpr;
     CW_CUDA_CHECK(cudaMalloc(&ws->xq,  (size_t)ws->batch_pad * ws->ld));
     CW_CUDA_CHECK(cudaMalloc(&ws->xq3, (size_t)batch * ws->triplets * sizeof(int32_t)));
-    CW_CUDA_CHECK(cudaMalloc(&ws->c3,  (size_t)batch * ws->triplets * sizeof(int32_t)));
     CW_CUDA_CHECK(cudaMalloc(&ws->sx,  (size_t)ws->batch_pad * sizeof(float)));
+    CW_CUDA_CHECK(cudaMalloc(&ws->sxq, (size_t)ws->batch_pad * sizeof(int32_t)));
 }
 
 static void cw_int8_workspace_free(CwInt8Workspace* ws) {
     CW_CUDA_WARN(cudaFree(ws->xq));
     CW_CUDA_WARN(cudaFree(ws->xq3));
-    CW_CUDA_WARN(cudaFree(ws->c3));
     CW_CUDA_WARN(cudaFree(ws->sx));
+    CW_CUDA_WARN(cudaFree(ws->sxq));
 }
 
-/* Per-row symmetric int8 quantisation of X.  grid = batch_pad, block = 256.
+/* Per-row symmetric int8 quantisation of X plus Σxq.  grid = batch_pad, block = 256.
  * Rows ≥ batch and columns ≥ cols are written as zero (tile padding). */
 __global__ void cw_quantize_x(const float* __restrict__ X, int8_t* __restrict__ xq,
-                              float* __restrict__ sx, uint32_t cols, uint32_t ld,
-                              uint32_t batch)
+                              float* __restrict__ sx, int32_t* __restrict__ sxq,
+                              uint32_t cols, uint32_t ld, uint32_t batch)
 {
     __shared__ float red[32];
+    __shared__ int   ired[32];
     const uint32_t b    = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t nw   = blockDim.x >> 5;
     const float*   xr   = X + (size_t)b * cols;
 
     float m = 0.0f;
@@ -524,7 +523,7 @@ __global__ void cw_quantize_x(const float* __restrict__ X, int8_t* __restrict__ 
     if (lane == 0) red[warp] = m;
     __syncthreads();
     if (warp == 0) {
-        m = lane < (blockDim.x >> 5) ? red[lane] : 0.0f;
+        m = lane < nw ? red[lane] : 0.0f;
         for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(CW_FULL_MASK, m, off));
         if (lane == 0) red[0] = m;
     }
@@ -532,45 +531,54 @@ __global__ void cw_quantize_x(const float* __restrict__ X, int8_t* __restrict__ 
     m = red[0];
 
     const float inv = m > 0.0f ? 127.0f / m : 0.0f;
-    if (threadIdx.x == 0) sx[b] = m / 127.0f;
+    int sum = 0;
     for (uint32_t c = threadIdx.x; c < ld; c += blockDim.x) {
         int q = 0;
         if (b < batch && c < cols) q = max(-127, min(127, __float2int_rn(xr[c] * inv)));
         xq[(size_t)b * ld + c] = (int8_t)q;
+        sum += q;
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(CW_FULL_MASK, sum, off);
+    if (lane == 0) ired[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int t = 0;
+        for (uint32_t i = 0; i < nw; i++) t += ired[i];
+        sxq[b] = t;
+        sx[b]  = m / 127.0f;
     }
 }
 
-/* Triplet packing for the __dp4a path: xq3 = (xq0, xq1, xq2, 0), c3 = 127·Σ. */
+/* Triplet packing for the __dp4a path: xq3 = (xq0, xq1, xq2, 0). */
 __global__ void cw_pack_x_triplets(const int8_t* __restrict__ xq, int32_t* __restrict__ xq3,
-                                   int32_t* __restrict__ c3, uint32_t ld, uint32_t triplets,
-                                   uint32_t batch)
+                                   uint32_t ld, uint32_t triplets, uint32_t batch)
 {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)batch * triplets) return;
     const uint32_t b = (uint32_t)(i / triplets), t = (uint32_t)(i % triplets);
     const int8_t*  p = xq + (size_t)b * ld + 3u * t;
-    const int a0 = p[0], a1 = p[1], a2 = p[2];
-    xq3[i] = (a0 & 0xFF) | ((a1 & 0xFF) << 8) | ((a2 & 0xFF) << 16);
-    c3[i]  = 127 * (a0 + a1 + a2);
+    xq3[i] = (p[0] & 0xFF) | ((p[1] & 0xFF) << 8) | ((p[2] & 0xFF) << 16);
 }
 
 /*
  * __dp4a GEMV (sm_61+, i.e. GTX 1080 Ti).  Same warp-per-row structure as
- * cw_fiver_gemv; per word: 6 shuffles for e, 2 × __dp4a per batch row.
+ * cw_fiver_gemv; per word: 6 shuffles for e, 2 × __dp4a per batch row,
+ * accumulated directly through the dp4a accumulator input.
  */
-template <int LAYOUT, int BT>
+template <int BT>
 __global__ void cw_fiver_gemv_dp4a(
     const uint32_t* __restrict__ W,
+    const float*    __restrict__ row_scale,
     const int32_t*  __restrict__ xq3,
-    const int32_t*  __restrict__ c3,
     const float*    __restrict__ sx,
+    const int32_t*  __restrict__ sxq,
     float*          __restrict__ Y,
-    uint32_t rows, uint32_t words_per_row, uint32_t batch, float scale)
+    uint32_t rows, uint32_t words_per_row, uint32_t batch, int grid)
 {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row  = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const uint32_t b0   = blockIdx.y * (uint32_t)BT;
-    const int      elut = cw_e_lut[lane];
+    const int      elut = cw_grid_e[grid][lane];
 
     if (row >= rows) return;   /* uniform per warp */
 
@@ -589,23 +597,17 @@ __global__ void cw_fiver_gemv_dp4a(
         int e[CW_WEIGHTS_PER_WORD];
 #pragma unroll
         for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++)
-            e[i] = __shfl_sync(CW_FULL_MASK, elut, (int)((word >> cw_k_shift(LAYOUT, i)) & 0x1Fu));
+            e[i] = __shfl_sync(CW_FULL_MASK, elut, (int)cw_k_at(word, i));
 
         if (!valid) continue;
 
         const int E0 = (e[0] & 0xFF) | ((e[1] & 0xFF) << 8) | ((e[2] & 0xFF) << 16);
         const int E1 = (e[3] & 0xFF) | ((e[4] & 0xFF) << 8) | ((e[5] & 0xFF) << 16);
-        const int n0 = -(int)((word >> cw_sign_shift(LAYOUT, 0)) & 1u);   /* 0 or −1 */
-        const int n1 = -(int)((word >> cw_sign_shift(LAYOUT, 3)) & 1u);
-
 #pragma unroll
         for (int b = 0; b < BT; b++) {
             if (b0 + b >= batch) break;
             const int2 xv = __ldg(reinterpret_cast<const int2*>(xq3 + (size_t)(b0 + b) * T) + wi);
-            const int2 cv = __ldg(reinterpret_cast<const int2*>(c3  + (size_t)(b0 + b) * T) + wi);
-            const int  v0 = __dp4a(E0, xv.x, cv.x);
-            const int  v1 = __dp4a(E1, xv.y, cv.y);
-            acc[b] += ((v0 ^ n0) - n0) + ((v1 ^ n1) - n1);   /* (v ^ −1) + 1 = −v */
+            acc[b] = __dp4a(E1, xv.y, __dp4a(E0, xv.x, acc[b]));
         }
     }
 
@@ -616,68 +618,66 @@ __global__ void cw_fiver_gemv_dp4a(
             acc[b] += __shfl_down_sync(CW_FULL_MASK, acc[b], off);
 
     if (lane == 0) {
-        const float f = scale * (1.0f / 127.0f);
+        const float f   = __ldg(&row_scale[row]) * (1.0f / 127.0f);
+        const float off = grid == CW_GRID_ANCHORED ? 127.0f : 0.0f;
 #pragma unroll
         for (int b = 0; b < BT; b++)
             if (b0 + b < batch)
-                Y[(size_t)(b0 + b) * rows + row] = (float)acc[b] * f * sx[b0 + b];
+                Y[(size_t)(b0 + b) * rows + row] =
+                    ((float)acc[b] + off * (float)sxq[b0 + b]) * f * sx[b0 + b];
     }
 }
 
 /*
  * INT8 Tensor-Core GEMM (sm_75+, WMMA 16×16×16 s8 → s32).  One warp per
  * block computes a 16-row × 16-batch output tile.  Per 96-column chunk the
- * warp decodes 16 rows × 16 words into two tiny shared-memory tiles
- * (A1 = σ, A2 = σ·e, 1.5 KB each) — weights in VRAM stay packed.
- * The x tile is transposed into shared memory so every 16-column sub-tile
- * starts 256-byte aligned, as load_matrix_sync requires.
+ * warp decodes 16 rows × 16 words of e-codes into a 1.5 KB shared tile —
+ * weights in VRAM stay packed.  The x tile is transposed into shared
+ * memory so every 16-column sub-tile starts 256-byte aligned, as
+ * load_matrix_sync requires.
  *
- * Pays off for batch ≥ 16; for batch 1 GEMV is memory-bound and the __dp4a
+ * Pays off for batch ≥ 16; at batch 1 GEMV is memory-bound and the __dp4a
  * kernel is the better choice.  Compiled empty below sm_75; the launcher
  * never selects it there.
  */
-template <int LAYOUT>
 __global__ void cw_fiver_gemm_tc(
     const uint32_t* __restrict__ W,
+    const float*    __restrict__ row_scale,
     const int8_t*   __restrict__ xq,
     const float*    __restrict__ sx,
+    const int32_t*  __restrict__ sxq,
     float*          __restrict__ Y,
-    uint32_t rows, uint32_t words_per_row, uint32_t batch, uint32_t ld, float scale)
+    uint32_t rows, uint32_t words_per_row, uint32_t batch, uint32_t ld,
+    int grid, uint32_t pad_word)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
     using namespace nvcuda;
-    __shared__ __align__(32) signed char A1[CW_TC_KCHUNK_COLS * CW_TC_TILE];  /* col-major [c][r] */
-    __shared__ __align__(32) signed char A2[CW_TC_KCHUNK_COLS * CW_TC_TILE];
+    __shared__ __align__(32) signed char As[CW_TC_KCHUNK_COLS * CW_TC_TILE];  /* col-major [c][r] */
     __shared__ __align__(32) signed char Bs[CW_TC_KCHUNK_COLS * CW_TC_TILE];  /* row-major [c][b] */
     __shared__ __align__(32) int         Cs[CW_TC_TILE * CW_TC_TILE];
 
     const uint32_t lane = threadIdx.x;   /* blockDim.x == 32 */
     const uint32_t row0 = blockIdx.x * CW_TC_TILE;
     const uint32_t b0   = blockIdx.y * CW_TC_TILE;
-    const int      elut = cw_e_lut[lane];
+    const int      elut = cw_grid_e[grid][lane];
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c1, c2;
-    wmma::fill_fragment(c1, 0);
-    wmma::fill_fragment(c2, 0);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc;
+    wmma::fill_fragment(acc, 0);
 
     for (uint32_t kw = 0; kw < words_per_row; kw += CW_TC_KCHUNK_WORDS) {
         /* Decode 16 rows × 16 words.  r = idx % 16 keeps the byte stores
-         * bank-conflict free; out-of-range words decode as k=0, σ=+1, whose
-         * contribution 127·1 + e(0) = 127 − 127 = 0 vanishes. */
+         * bank-conflict free.  Out-of-range words use the zero code; their
+         * columns meet zero x anyway (xq padding). */
         for (uint32_t j = 0; j < 8u; j++) {
             const uint32_t idx = j * 32u + lane;
             const uint32_t r   = idx & 15u, wc = idx >> 4;
             const uint32_t row = row0 + r,  wi = kw + wc;
             const uint32_t word = (row < rows && wi < words_per_row)
-                                ? __ldg(&W[(size_t)row * words_per_row + wi]) : 0u;
+                                ? __ldg(&W[(size_t)row * words_per_row + wi]) : pad_word;
 #pragma unroll
             for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++) {
-                const int      e = __shfl_sync(CW_FULL_MASK, elut,
-                                               (int)((word >> cw_k_shift(LAYOUT, i)) & 0x1Fu));
-                const uint32_t s = (word >> cw_sign_shift(LAYOUT, i)) & 1u;
-                const uint32_t c = wc * CW_WEIGHTS_PER_WORD + (uint32_t)i;
-                A1[c * CW_TC_TILE + r] = (signed char)(s ? -1 : 1);
-                A2[c * CW_TC_TILE + r] = (signed char)(s ? -e : e);
+                const int e = __shfl_sync(CW_FULL_MASK, elut, (int)cw_k_at(word, i));
+                As[(wc * CW_WEIGHTS_PER_WORD + (uint32_t)i) * CW_TC_TILE + r] = (signed char)e;
             }
         }
         /* x tile: 16 batch rows × 96 columns = 384 int32 loads, transposed.
@@ -696,26 +696,25 @@ __global__ void cw_fiver_gemm_tc(
 
 #pragma unroll
         for (int kk = 0; kk < (int)(CW_TC_KCHUNK_COLS / 16u); kk++) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::col_major> a1, a2;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::col_major> a;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::row_major> bf;
-            wmma::load_matrix_sync(a1, A1 + kk * 256, CW_TC_TILE);
-            wmma::load_matrix_sync(a2, A2 + kk * 256, CW_TC_TILE);
+            wmma::load_matrix_sync(a,  As + kk * 256, CW_TC_TILE);
             wmma::load_matrix_sync(bf, Bs + kk * 256, CW_TC_TILE);
-            wmma::mma_sync(c1, a1, bf, c1);
-            wmma::mma_sync(c2, a2, bf, c2);
+            wmma::mma_sync(acc, a, bf, acc);
         }
         __syncwarp();
     }
 
-    for (int i = 0; i < c2.num_elements; i++) c2.x[i] += 127 * c1.x[i];
-    wmma::store_matrix_sync(Cs, c2, CW_TC_TILE, wmma::mem_row_major);   /* Cs[r][b] */
+    wmma::store_matrix_sync(Cs, acc, CW_TC_TILE, wmma::mem_row_major);   /* Cs[r][b] */
     __syncwarp();
 
-    const float f = scale * (1.0f / 127.0f);
+    const float off = grid == CW_GRID_ANCHORED ? 127.0f : 0.0f;
     for (uint32_t idx = lane; idx < CW_TC_TILE * CW_TC_TILE; idx += 32u) {
         const uint32_t r = idx >> 4, b = idx & 15u;
         if (row0 + r < rows && b0 + b < batch)
-            Y[(size_t)(b0 + b) * rows + row0 + r] = (float)Cs[idx] * f * sx[b0 + b];
+            Y[(size_t)(b0 + b) * rows + row0 + r] =
+                ((float)Cs[idx] + off * (float)sxq[b0 + b])
+                * row_scale[row0 + r] * (1.0f / 127.0f) * sx[b0 + b];
     }
 #endif
 }
@@ -729,8 +728,8 @@ static int cw_device_has_int8_tc(void) {
 }
 
 /*
- * y = W·x through the INT8 decomposition.  Quantises X into ws, then runs
- * the Tensor-Core GEMM (use_tc, sm_75+) or the __dp4a GEMV.
+ * y = W·x through the INT8 path.  Quantises X into ws, then runs the
+ * Tensor-Core GEMM (use_tc, sm_75+) or the __dp4a GEMV.
  * Returns 0 without launching anything if the matrix is not eligible.
  */
 static int cw_fiver_gemv_int8(const FiverMatrix* m, const float* d_x, float* d_y,
@@ -740,32 +739,26 @@ static int cw_fiver_gemv_int8(const FiverMatrix* m, const float* d_x, float* d_y
     if (use_tc && !cw_device_has_int8_tc()) return 0;
 
     const uint32_t batch = ws->batch;
-    cw_quantize_x<<<ws->batch_pad, 256, 0, stream>>>(d_x, ws->xq, ws->sx, m->cols, ws->ld, batch);
-
+    cw_quantize_x<<<ws->batch_pad, 256, 0, stream>>>(d_x, ws->xq, ws->sx, ws->sxq,
+                                                     m->cols, ws->ld, batch);
     if (use_tc) {
         dim3 grid((m->rows + CW_TC_TILE - 1u) / CW_TC_TILE, ws->batch_pad / CW_TC_TILE);
-        if (m->layout == CW_LAYOUT_U32)
-            cw_fiver_gemm_tc<CW_LAYOUT_U32><<<grid, 32, 0, stream>>>(
-                m->words, ws->xq, ws->sx, d_y, m->rows, m->words_per_row, batch, ws->ld, m->scale);
-        else
-            cw_fiver_gemm_tc<CW_LAYOUT_U16><<<grid, 32, 0, stream>>>(
-                m->words, ws->xq, ws->sx, d_y, m->rows, m->words_per_row, batch, ws->ld, m->scale);
+        cw_fiver_gemm_tc<<<grid, 32, 0, stream>>>(
+            m->words, m->row_scale, ws->xq, ws->sx, ws->sxq, d_y, m->rows, m->words_per_row,
+            batch, ws->ld, m->grid, cw_pad_word(m->grid));
         return 1;
     }
 
     const size_t n3 = (size_t)batch * ws->triplets;
     cw_pack_x_triplets<<<(unsigned)((n3 + 255u) / 256u), 256, 0, stream>>>(
-        ws->xq, ws->xq3, ws->c3, ws->ld, ws->triplets, batch);
+        ws->xq, ws->xq3, ws->ld, ws->triplets, batch);
 
     dim3 block(32u * CW_GEMV_WARPS);
     dim3 grid((m->rows + CW_GEMV_WARPS - 1u) / CW_GEMV_WARPS,
               (batch + CW_GEMV_BT - 1u) / CW_GEMV_BT);
-    if (m->layout == CW_LAYOUT_U32)
-        cw_fiver_gemv_dp4a<CW_LAYOUT_U32, CW_GEMV_BT><<<grid, block, 0, stream>>>(
-            m->words, ws->xq3, ws->c3, ws->sx, d_y, m->rows, m->words_per_row, batch, m->scale);
-    else
-        cw_fiver_gemv_dp4a<CW_LAYOUT_U16, CW_GEMV_BT><<<grid, block, 0, stream>>>(
-            m->words, ws->xq3, ws->c3, ws->sx, d_y, m->rows, m->words_per_row, batch, m->scale);
+    cw_fiver_gemv_dp4a<CW_GEMV_BT><<<grid, block, 0, stream>>>(
+        m->words, m->row_scale, ws->xq3, ws->sx, ws->sxq, d_y, m->rows, m->words_per_row,
+        batch, m->grid);
     return 1;
 }
 
@@ -777,46 +770,46 @@ static int cw_fiver_gemv_int8(const FiverMatrix* m, const float* d_x, float* d_y
  *
  * For one minibatch (dY already contains the activation derivative):
  *
- *   1.  dX[b,c] = s · Σ_r W[r,c] · dY[b,r]        cw_fiver_gemv_t
+ *   1.  dX[b,c] = Σ_r row_scale[r] · v(k[r,c]) · dY[b,r]    cw_fiver_gemv_t
  *       uses the weights *before* the update, as fiver.py does.
  *
- *   2.  g_rc  = Σ_b dY[b,r] · X[b,c]              cw_fiver_ste_update
- *       k_rc ← clamp(k_rc − sign(σ_rc · lr · g_rc), 0, 31)
+ *   2.  g_rc  = Σ_b dY[b,r] · X[b,c]                         cw_fiver_ste_update
+ *       k_rc ← clamp(k_rc − sign(lr · g_rc), 0, 31)
  *       bias_r −= lr · Σ_b dY[b,r]
  *
- * Why σ·g:  w = σ · s · f(k) with f strictly increasing and s ≥ 0, so
- * sign(∂L/∂k) = σ · sign(∂L/∂w).  Per-weight activations (sqrt, log1p,
- * softsign) are odd and increasing, so they never change that sign either.
- * Shared sign bits are not trained (same as fiver.py).
+ * Both grids are strictly increasing in k and row_scale ≥ 0, so
+ * sign(∂L/∂k) = sign(∂L/∂W).  The activations are odd and increasing and do
+ * not change that sign either.  On the CENTERED grid k simply walks through
+ * zero (code 16) when a weight changes sign — no sign bits to manage.
  *
  * g_rc is formed in registers and consumed immediately: the full
  * out × in gradient matrix never exists.  This requires one update per
- * minibatch (train.py: backward → step), i.e. no gradient accumulation
- * across several backward calls.  Padding columns get g = 0 and keep k = 0.
+ * minibatch (train.py: backward → step).  Padding columns keep their code.
  */
 #define CW_BWD_RT  4    /* rows per warp in the update kernel (reuses X loads) */
 
 /*
- * dX = s · Wᵀ · dY.  One thread per packed column word, looping over a slice
- * of rows; partial sums are combined with atomicAdd (dX must be zeroed).
- * grid = (ceil(wpr / 128), row slices, ceil(batch / BT)).
+ * dX = Wᵀ · (row_scale ∘ dY).  One thread per packed column word, looping
+ * over a slice of rows; partial sums are combined with atomicAdd (dX must
+ * be zeroed).  grid = (ceil(wpr / 128), row slices, ceil(batch / BT)).
  * All lanes run the same row loop, so the decode shuffles stay convergent.
  */
-template <int LAYOUT, int BT>
+template <int BT>
 __global__ void cw_fiver_gemv_t(
     const uint32_t* __restrict__ W,
+    const float*    __restrict__ row_scale,
     const uint32_t* __restrict__ act_bits,
     const float*    __restrict__ dY,
     float*          __restrict__ dX,
     uint32_t rows, uint32_t cols, uint32_t words_per_row,
-    uint32_t batch, uint32_t rows_per_slice, float scale, uint8_t flags)
+    uint32_t batch, uint32_t rows_per_slice, int grid, uint8_t flags)
 {
     const uint32_t wi    = blockIdx.x * blockDim.x + threadIdx.x;
     const bool     valid = wi < words_per_row;
     const uint32_t r0    = blockIdx.y * rows_per_slice;
     const uint32_t r1    = min(rows, r0 + rows_per_slice);
     const uint32_t b0    = blockIdx.z * (uint32_t)BT;
-    const float    lut   = cw_fiver_lut[threadIdx.x & 31u];
+    const float    lut   = cw_grid_lut[grid][threadIdx.x & 31u];
 
     float acc[BT][CW_WEIGHTS_PER_WORD];
 #pragma unroll
@@ -828,12 +821,8 @@ __global__ void cw_fiver_gemv_t(
         const uint32_t word = valid ? __ldg(&W[(size_t)r * words_per_row + wi]) : 0u;
         float w[CW_WEIGHTS_PER_WORD];
 #pragma unroll
-        for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++) {
-            const uint32_t k = (word >> cw_k_shift(LAYOUT, i)) & 0x1Fu;
-            const uint32_t s = (word >> cw_sign_shift(LAYOUT, i)) & 1u;
-            const float    v = __shfl_sync(CW_FULL_MASK, lut, (int)k);
-            w[i] = __int_as_float(__float_as_int(v) ^ (int)(s << 31));
-        }
+        for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++)
+            w[i] = __shfl_sync(CW_FULL_MASK, lut, (int)cw_k_at(word, i));
         if (!valid) continue;
         if (flags & CW_FLAG_HAS_ACT) {
 #pragma unroll
@@ -843,10 +832,11 @@ __global__ void cw_fiver_gemv_t(
                 w[i] = cw_apply_act(w[i], code);
             }
         }
+        const float s = __ldg(&row_scale[r]);                              /* warp-uniform */
 #pragma unroll
         for (int b = 0; b < BT; b++) {
             if (b0 + b >= batch) break;
-            const float g = __ldg(&dY[(size_t)(b0 + b) * rows + r]);   /* warp-uniform */
+            const float g = s * __ldg(&dY[(size_t)(b0 + b) * rows + r]);  /* warp-uniform */
 #pragma unroll
             for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++) acc[b][i] = fmaf(w[i], g, acc[b][i]);
         }
@@ -859,7 +849,7 @@ __global__ void cw_fiver_gemv_t(
 #pragma unroll
         for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++) {
             const uint32_t c = wi * CW_WEIGHTS_PER_WORD + (uint32_t)i;
-            if (c < cols) atomicAdd(&dX[(size_t)(b0 + b) * cols + c], acc[b][i] * scale);
+            if (c < cols) atomicAdd(&dX[(size_t)(b0 + b) * cols + c], acc[b][i]);
         }
     }
 }
@@ -867,10 +857,9 @@ __global__ void cw_fiver_gemv_t(
 /*
  * Fused STE update.  One warp handles CW_BWD_RT rows; each lane owns one
  * packed word column of those rows and accumulates 6 × RT gradients in
- * registers, so every X load is reused RT times.  No shuffles here: only
- * the k bits are touched, the word is rewritten in place if a k changed.
+ * registers, so every X load is reused RT times.  No shuffles: only the
+ * code bits are touched, the word is rewritten in place if a code changed.
  */
-template <int LAYOUT>
 __global__ void cw_fiver_ste_update(
     uint32_t*    __restrict__ W,
     const float* __restrict__ X,
@@ -912,11 +901,12 @@ __global__ void cw_fiver_ste_update(
             uint32_t  word = *wp, out = word;
 #pragma unroll
             for (int i = 0; i < (int)CW_WEIGHTS_PER_WORD; i++) {
-                const uint32_t sh = cw_k_shift(LAYOUT, i);
+                if (c0 + i >= cols) break;                     /* padding keeps its code */
+                const uint32_t sh = 5u * (uint32_t)i;
                 const uint32_t k  = (word >> sh) & 0x1Fu;
-                const float    d  = (((word >> cw_sign_shift(LAYOUT, i)) & 1u) ? -g[q][i] : g[q][i]) * lr;
+                const float    d  = g[q][i] * lr;
                 const uint32_t kn = (d > 0.0f) ? (k > 0u ? k - 1u : 0u)
-                                  : (d < 0.0f) ? (k < 31u ? k + 1u : 31u) : k;
+                                  : (d < 0.0f) ? (k < CW_K_MAX ? k + 1u : CW_K_MAX) : k;
                 out = (out & ~(0x1Fu << sh)) | (kn << sh);
             }
             if (out != word) *wp = out;
@@ -944,34 +934,27 @@ static void cw_fiver_backward_step(const FiverMatrix* m, const float* d_x, const
         dim3 grid((m->words_per_row + 127u) / 128u,
                   (m->rows + rows_per_slice - 1u) / rows_per_slice,
                   (batch + CW_GEMV_BT - 1u) / CW_GEMV_BT);
-        if (m->layout == CW_LAYOUT_U32)
-            cw_fiver_gemv_t<CW_LAYOUT_U32, CW_GEMV_BT><<<grid, 128, 0, stream>>>(
-                m->words, m->act_bits, d_dy, d_dx, m->rows, m->cols, m->words_per_row,
-                batch, rows_per_slice, m->scale, m->flags);
-        else
-            cw_fiver_gemv_t<CW_LAYOUT_U16, CW_GEMV_BT><<<grid, 128, 0, stream>>>(
-                m->words, m->act_bits, d_dy, d_dx, m->rows, m->cols, m->words_per_row,
-                batch, rows_per_slice, m->scale, m->flags);
+        cw_fiver_gemv_t<CW_GEMV_BT><<<grid, 128, 0, stream>>>(
+            m->words, m->row_scale, m->act_bits, d_dy, d_dx, m->rows, m->cols,
+            m->words_per_row, batch, rows_per_slice, m->grid, m->flags);
     }
 
     const uint32_t warps = 4u, rows_per_block = warps * CW_BWD_RT;
     dim3 grid((m->rows + rows_per_block - 1u) / rows_per_block);
-    if (m->layout == CW_LAYOUT_U32)
-        cw_fiver_ste_update<CW_LAYOUT_U32><<<grid, 32u * warps, 0, stream>>>(
-            m->words, d_x, d_dy, d_bias, m->rows, m->cols, m->words_per_row, batch, lr);
-    else
-        cw_fiver_ste_update<CW_LAYOUT_U16><<<grid, 32u * warps, 0, stream>>>(
-            m->words, d_x, d_dy, d_bias, m->rows, m->cols, m->words_per_row, batch, lr);
+    cw_fiver_ste_update<<<grid, 32u * warps, 0, stream>>>(
+        m->words, d_x, d_dy, d_bias, m->rows, m->cols, m->words_per_row, batch, lr);
 }
 
 
 /*
  * ╔══════════════════════════════════════════════════════════════════════╗
  * ║                    TEST / BENCHMARK  BLOCK                          ║
- * ║  host pack/decode · rsqrt bench · GEMV test · GEMV bench · main     ║
+ * ║  host helpers · rsqrt bench · tests · GEMV / backward benchmarks    ║
  * ║  (--bench-a | --bench-b | --bench-gemv | --bench-bwd | --test)      ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  */
+
+static const char* cw_grid_name(int grid) { return grid == CW_GRID_ANCHORED ? "anch" : "cent"; }
 
 static uint32_t cw_rng_state = 0x12345678u;
 static uint32_t cw_rand(void) {               /* xorshift32, deterministic */
@@ -980,24 +963,104 @@ static uint32_t cw_rand(void) {               /* xorshift32, deterministic */
     cw_rng_state ^= cw_rng_state << 5;
     return cw_rng_state;
 }
-
-/* Pack 6 k-values + two half-signs into one word of the given layout. */
-static uint32_t cw_pack_word(int layout, const uint8_t k[6], uint32_t s_lo, uint32_t s_hi) {
-    uint32_t w = 0;
-    for (int i = 0; i < 6; i++) w |= ((uint32_t)k[i] & 0x1Fu) << cw_k_shift(layout, i);
-    w |= (s_lo & 1u) << cw_sign_shift(layout, 0);
-    w |= (s_hi & 1u) << cw_sign_shift(layout, 3);
-    return w;
+static float cw_randf(float lo, float hi) {
+    return lo + (hi - lo) * (float)(cw_rand() & 0xFFFFFFu) / (float)0x1000000;
 }
 
-/* Host decode of one packed weight (row-local padded column c). */
-static float cw_decode_cpu(int layout, const uint32_t* row_words, uint32_t c) {
-    uint32_t word = row_words[c / 6u];
-    int      i    = (int)(c % 6u);
-    uint8_t  k    = (uint8_t)((word >> cw_k_shift(layout, i)) & 0x1Fu);
-    uint32_t s    = (word >> cw_sign_shift(layout, i)) & 1u;
-    float    v    = cw_fiver_to_float_cpu(k);
-    return s ? -v : v;
+/* Host decode of one weight (row-local column c), unscaled. */
+static float cw_decode_cpu(int grid, const uint32_t* row_words, uint32_t c) {
+    return cw_value_cpu(grid, cw_k_at(row_words[c / 6u], (int)(c % 6u)));
+}
+
+/* Random packed matrix on host: random codes, zero code in padding, random
+ * positive row scales, optional act codes. */
+typedef struct {
+    uint32_t* words;
+    uint32_t* act;
+    float*    scale;
+    uint32_t  wpr;
+    uint32_t  padded;
+} CwHostMatrix;
+
+static CwHostMatrix make_random_matrix(int grid, uint32_t rows, uint32_t cols, int with_act) {
+    CwHostMatrix h;
+    h.wpr    = cw_words_per_row(cols);
+    h.padded = h.wpr * CW_WEIGHTS_PER_WORD;
+    h.words  = (uint32_t*)malloc((size_t)rows * h.wpr * sizeof(uint32_t));
+    h.scale  = (float*)malloc(rows * sizeof(float));
+    h.act    = NULL;
+    for (uint32_t r = 0; r < rows; r++) {
+        h.scale[r] = cw_randf(0.01f, 0.1f);
+        for (uint32_t wi = 0; wi < h.wpr; wi++) {
+            uint8_t k[6];
+            for (int i = 0; i < 6; i++)
+                k[i] = (wi * 6u + (uint32_t)i < cols) ? (uint8_t)(cw_rand() & 0x1Fu)
+                                                      : (uint8_t)cw_pad_k(grid);
+            h.words[(size_t)r * h.wpr + wi] = cw_pack_word(k);
+        }
+    }
+    if (with_act) {
+        size_t n_act = ((size_t)rows * h.padded + 15u) / 16u;
+        h.act = (uint32_t*)malloc(n_act * sizeof(uint32_t));
+        for (size_t i = 0; i < n_act; i++) h.act[i] = cw_rand();
+    }
+    return h;
+}
+
+static void free_host_matrix(CwHostMatrix* h) { free(h->words); free(h->act); free(h->scale); }
+
+/* Upload a host matrix; returns a FiverMatrix with device pointers. */
+static FiverMatrix upload_matrix(const CwHostMatrix* h, int grid, uint32_t rows, uint32_t cols) {
+    FiverMatrix m;
+    uint32_t*   d_words;
+    float*      d_scale;
+    uint32_t*   d_act = NULL;
+    CW_CUDA_CHECK(cudaMalloc(&d_words, (size_t)rows * h->wpr * sizeof(uint32_t)));
+    CW_CUDA_CHECK(cudaMalloc(&d_scale, rows * sizeof(float)));
+    CW_CUDA_CHECK(cudaMemcpy(d_words, h->words, (size_t)rows * h->wpr * sizeof(uint32_t),
+                             cudaMemcpyHostToDevice));
+    CW_CUDA_CHECK(cudaMemcpy(d_scale, h->scale, rows * sizeof(float), cudaMemcpyHostToDevice));
+    if (h->act) {
+        size_t n_act = ((size_t)rows * h->padded + 15u) / 16u;
+        CW_CUDA_CHECK(cudaMalloc(&d_act, n_act * sizeof(uint32_t)));
+        CW_CUDA_CHECK(cudaMemcpy(d_act, h->act, n_act * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    }
+    m.words = d_words; m.row_scale = d_scale; m.act_bits = d_act;
+    m.rows = rows; m.cols = cols; m.words_per_row = h->wpr; m.grid = grid;
+    m.flags = (uint8_t)(h->act ? CW_FLAG_HAS_ACT : 0u);
+    return m;
+}
+
+static void free_matrix(FiverMatrix* m) {
+    CW_CUDA_WARN(cudaFree(m->words));
+    CW_CUDA_WARN(cudaFree((void*)m->row_scale));
+    if (m->act_bits) CW_CUDA_WARN(cudaFree((void*)m->act_bits));
+}
+
+static float* upload_random(size_t n, float lo, float hi, float** host_out) {
+    float* h = (float*)malloc(n * sizeof(float));
+    for (size_t i = 0; i < n; i++) h[i] = cw_randf(lo, hi);
+    float* d;
+    CW_CUDA_CHECK(cudaMalloc(&d, n * sizeof(float)));
+    CW_CUDA_CHECK(cudaMemcpy(d, h, n * sizeof(float), cudaMemcpyHostToDevice));
+    *host_out = h;
+    return d;
+}
+
+static float* download(const float* d, size_t n) {
+    float* h = (float*)malloc(n * sizeof(float));
+    CW_CUDA_CHECK(cudaMemcpy(h, d, n * sizeof(float), cudaMemcpyDeviceToHost));
+    return h;
+}
+
+/* Effective (activated, unscaled) weight on the host. */
+static float cw_weight_cpu(int grid, const CwHostMatrix* h, uint32_t r, uint32_t c) {
+    float w = cw_decode_cpu(grid, h->words + (size_t)r * h->wpr, c);
+    if (h->act) {
+        size_t idx = (size_t)r * h->padded + c;
+        w = cw_apply_act(w, (h->act[idx >> 4] >> ((idx & 15u) * 2u)) & 3u);
+    }
+    return w;
 }
 
 __global__
@@ -1077,284 +1140,209 @@ static void run_benchmark(const char* label, int use_quake, int iterations) {
     CW_CUDA_WARN(cudaEventDestroy(t1));
 }
 
-/* Random packed matrix on host: random k, random half-signs, optional act codes. */
-static void make_random_matrix(int layout, uint32_t rows, uint32_t cols, int with_act,
-                               uint32_t** words_out, uint32_t** act_out) {
-    uint32_t wpr    = cw_words_per_row(cols);
-    uint32_t padded = wpr * CW_WEIGHTS_PER_WORD;
-    uint32_t* words = (uint32_t*)malloc((size_t)rows * wpr * sizeof(uint32_t));
-    for (uint32_t r = 0; r < rows; r++) {
-        for (uint32_t wi = 0; wi < wpr; wi++) {
-            uint8_t k[6];
-            for (int i = 0; i < 6; i++) {
-                uint32_t c = wi * 6u + (uint32_t)i;
-                k[i] = (c < cols) ? (uint8_t)(cw_rand() & 0x1Fu) : 0u;
-            }
-            uint32_t s_lo = cw_rand() & 1u, s_hi = cw_rand() & 1u;
-            if (wi * 6u + 3u >= cols) s_hi = 0u;    /* padded half carries no sign */
-            words[(size_t)r * wpr + wi] = cw_pack_word(layout, k, s_lo, s_hi);
+/* 1. Both grids: GPU LUTs (shuffle path) vs the independent host formula. */
+static int run_lut_test(void) {
+    int failures = 0;
+    float* d_v; int* d_e;
+    CW_CUDA_CHECK(cudaMalloc(&d_v, 32 * sizeof(float)));
+    CW_CUDA_CHECK(cudaMalloc(&d_e, 32 * sizeof(int)));
+    for (int grid = 0; grid <= 1; grid++) {
+        float h_v[32]; int h_e[32];
+        cw_lut_probe<<<1, 32>>>(d_v, d_e, grid);
+        CW_CUDA_CHECK(cudaGetLastError());
+        CW_CUDA_CHECK(cudaMemcpy(h_v, d_v, sizeof(h_v), cudaMemcpyDeviceToHost));
+        CW_CUDA_CHECK(cudaMemcpy(h_e, d_e, sizeof(h_e), cudaMemcpyDeviceToHost));
+        uint32_t ev = 0, ee = 0, mono = 0;
+        for (uint32_t k = 0; k < 32; k++) {
+            if (fabsf(h_v[k] - cw_value_cpu(grid, k)) > 1e-6f) ev++;
+            if (h_e[k] != cw_e_cpu(grid, k)) ee++;
+            if (k > 0 && !(h_v[k] > h_v[k - 1] && h_e[k] > h_e[k - 1])) mono++;
         }
+        const int zero_ok = h_v[cw_pad_k(grid)] == 0.0f;
+        printf("  grid=%s  value errors=%u  int8 errors=%u  non-monotone=%u  zero code ok=%s\n",
+               cw_grid_name(grid), ev, ee, mono, zero_ok ? "yes" : "NO");
+        failures += (ev || ee || mono || !zero_ok);
     }
-    *words_out = words;
-    *act_out   = NULL;
-    if (with_act) {
-        size_t n_act = ((size_t)rows * padded + 15u) / 16u;
-        uint32_t* act = (uint32_t*)malloc(n_act * sizeof(uint32_t));
-        for (size_t i = 0; i < n_act; i++) act[i] = cw_rand();
-        *act_out = act;
-    }
+    CW_CUDA_WARN(cudaFree(d_v));
+    CW_CUDA_WARN(cudaFree(d_e));
+    return failures == 0;
 }
 
-static int run_gemv_case(int layout, uint32_t rows, uint32_t cols, uint32_t batch,
-                         int with_act) {
-    uint32_t wpr    = cw_words_per_row(cols);
-    uint32_t padded = wpr * CW_WEIGHTS_PER_WORD;
-    uint32_t *h_words, *h_act;
-    make_random_matrix(layout, rows, cols, with_act, &h_words, &h_act);
-
-    float* h_x   = (float*)malloc((size_t)batch * cols * sizeof(float));
-    float* h_y   = (float*)malloc((size_t)batch * rows * sizeof(float));
-    for (size_t i = 0; i < (size_t)batch * cols; i++)
-        h_x[i] = ((float)(cw_rand() & 0xFFFFu) / 32768.0f) - 1.0f;
-    const float scale = 0.0371f;
-
-    uint32_t *d_words, *d_act = NULL;
-    float *d_x, *d_y;
-    size_t n_words = (size_t)rows * wpr;
-    size_t n_act   = ((size_t)rows * padded + 15u) / 16u;
-    CW_CUDA_CHECK(cudaMalloc(&d_words, n_words * sizeof(uint32_t)));
-    CW_CUDA_CHECK(cudaMalloc(&d_x, (size_t)batch * cols * sizeof(float)));
+/* 2. Fused float GEMV vs host double-precision reference. */
+static int run_gemv_case(int grid, uint32_t rows, uint32_t cols, uint32_t batch, int with_act) {
+    CwHostMatrix h = make_random_matrix(grid, rows, cols, with_act);
+    FiverMatrix  m = upload_matrix(&h, grid, rows, cols);
+    float* h_x;
+    float* d_x = upload_random((size_t)batch * cols, -1.0f, 1.0f, &h_x);
+    float* d_y;
     CW_CUDA_CHECK(cudaMalloc(&d_y, (size_t)batch * rows * sizeof(float)));
-    CW_CUDA_CHECK(cudaMemcpy(d_words, h_words, n_words * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemcpy(d_x, h_x, (size_t)batch * cols * sizeof(float), cudaMemcpyHostToDevice));
-    if (with_act) {
-        CW_CUDA_CHECK(cudaMalloc(&d_act, n_act * sizeof(uint32_t)));
-        CW_CUDA_CHECK(cudaMemcpy(d_act, h_act, n_act * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    }
 
-    FiverMatrix m = { d_words, d_act, rows, cols, wpr, scale, layout,
-                      (uint8_t)(with_act ? CW_FLAG_HAS_ACT : 0u) };
     cw_fiver_gemv_launch(&m, d_x, d_y, batch, 0);
     CW_CUDA_CHECK(cudaGetLastError());
     CW_CUDA_CHECK(cudaDeviceSynchronize());
-    CW_CUDA_CHECK(cudaMemcpy(h_y, d_y, (size_t)batch * rows * sizeof(float), cudaMemcpyDeviceToHost));
+    float* h_y = download(d_y, (size_t)batch * rows);
 
     double worst = 0.0;
-    for (uint32_t b = 0; b < batch; b++) {
+    for (uint32_t b = 0; b < batch; b++)
         for (uint32_t r = 0; r < rows; r++) {
-            const uint32_t* rw = h_words + (size_t)r * wpr;
             double ref = 0.0, mag = 0.0;
             for (uint32_t c = 0; c < cols; c++) {
-                float w = cw_decode_cpu(layout, rw, c);
-                if (with_act) {
-                    size_t idx = (size_t)r * padded + c;
-                    w = cw_apply_act(w, (h_act[idx >> 4] >> ((idx & 15u) * 2u)) & 3u);
-                }
-                double xv = h_x[(size_t)b * cols + c];
-                ref += (double)w * xv;
-                mag += fabs((double)w * xv);
+                double t = (double)cw_weight_cpu(grid, &h, r, c) * h_x[(size_t)b * cols + c];
+                ref += t; mag += fabs(t);
             }
-            ref *= scale; mag *= scale;
+            ref *= h.scale[r]; mag *= h.scale[r];
             double err = fabs((double)h_y[(size_t)b * rows + r] - ref) / (mag + 1e-12);
             if (err > worst) worst = err;
         }
-    }
     int ok = worst < 1e-5;
-    printf("  layout=%s  %4ux%-5u  batch=%u  act=%d   max_rel_err=%.2e  %s\n",
-           layout == CW_LAYOUT_U32 ? "u32" : "u16", rows, cols, batch, with_act,
-           worst, ok ? "ok" : "FAIL");
+    printf("  grid=%s  %4ux%-5u  batch=%-3u act=%d   max_rel_err=%.2e  %s\n",
+           cw_grid_name(grid), rows, cols, batch, with_act, worst, ok ? "ok" : "FAIL");
 
-    CW_CUDA_WARN(cudaFree(d_words)); CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_y));
-    if (d_act) CW_CUDA_WARN(cudaFree(d_act));
-    free(h_words); free(h_act); free(h_x); free(h_y);
+    free_matrix(&m); free_host_matrix(&h);
+    CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_y));
+    free(h_x); free(h_y);
     return ok;
 }
 
 /*
- * INT8 path check.  The device-quantised x (xq, sx) is read back and the
+ * 3. INT8 path.  The device-quantised x (xq, sx) is read back and the
  * integer sum is recomputed on the host — it must match exactly (tolerance
  * below one integer unit).  The deviation from the exact float result
- * (quantisation error of x and d) is reported separately.
+ * (quantisation of x and v) is reported separately.
  */
-static int run_int8_case(int layout, uint32_t rows, uint32_t cols, uint32_t batch, int use_tc) {
-    uint32_t wpr = cw_words_per_row(cols);
-    uint32_t *h_words, *h_act;
-    make_random_matrix(layout, rows, cols, 0, &h_words, &h_act);
-
+static int run_int8_case(int grid, uint32_t rows, uint32_t cols, uint32_t batch, int use_tc) {
+    CwHostMatrix h = make_random_matrix(grid, rows, cols, 0);
+    FiverMatrix  m = upload_matrix(&h, grid, rows, cols);
     float* h_x = (float*)malloc((size_t)batch * cols * sizeof(float));
-    float* h_y = (float*)malloc((size_t)batch * rows * sizeof(float));
-    for (size_t i = 0; i < (size_t)batch * cols; i++)
-        h_x[i] = ((float)(cw_rand() & 0xFFFFu) / 32768.0f) - 1.0f;
+    for (size_t i = 0; i < (size_t)batch * cols; i++) h_x[i] = cw_randf(-1.0f, 1.0f);
     for (uint32_t c = 0; c < cols; c++) h_x[c] = 0.0f;   /* row 0 all-zero: sx = 0 edge case */
-    const float scale = 0.0371f;
-
-    uint32_t* d_words; float *d_x, *d_y;
-    size_t n_words = (size_t)rows * wpr;
-    CW_CUDA_CHECK(cudaMalloc(&d_words, n_words * sizeof(uint32_t)));
+    float *d_x, *d_y;
     CW_CUDA_CHECK(cudaMalloc(&d_x, (size_t)batch * cols * sizeof(float)));
     CW_CUDA_CHECK(cudaMalloc(&d_y, (size_t)batch * rows * sizeof(float)));
-    CW_CUDA_CHECK(cudaMemcpy(d_words, h_words, n_words * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CW_CUDA_CHECK(cudaMemcpy(d_x, h_x, (size_t)batch * cols * sizeof(float), cudaMemcpyHostToDevice));
 
     CwInt8Workspace ws;
     cw_int8_workspace_alloc(&ws, cols, batch);
-    FiverMatrix m = { d_words, NULL, rows, cols, wpr, scale, layout, 0 };
     int ok = cw_fiver_gemv_int8(&m, d_x, d_y, &ws, use_tc, 0);
     if (ok) {
         CW_CUDA_CHECK(cudaGetLastError());
         CW_CUDA_CHECK(cudaDeviceSynchronize());
+        float*  h_y  = download(d_y, (size_t)batch * rows);
+        float*  h_sx = download(ws.sx, ws.batch_pad);
         int8_t* h_xq = (int8_t*)malloc((size_t)ws.batch_pad * ws.ld);
-        float*  h_sx = (float*)malloc((size_t)ws.batch_pad * sizeof(float));
-        CW_CUDA_CHECK(cudaMemcpy(h_y,  d_y,  (size_t)batch * rows * sizeof(float), cudaMemcpyDeviceToHost));
         CW_CUDA_CHECK(cudaMemcpy(h_xq, ws.xq, (size_t)ws.batch_pad * ws.ld, cudaMemcpyDeviceToHost));
-        CW_CUDA_CHECK(cudaMemcpy(h_sx, ws.sx, (size_t)ws.batch_pad * sizeof(float), cudaMemcpyDeviceToHost));
+        const long long off = grid == CW_GRID_ANCHORED ? 127 : 0;
 
         double worst_exact = 0.0, max_qerr = 0.0, max_ref = 0.0;
         for (uint32_t b = 0; b < batch; b++) {
             const int8_t* xqr = h_xq + (size_t)b * ws.ld;
+            long long sxq = 0;
+            for (uint32_t c = 0; c < cols; c++) sxq += xqr[c];
             for (uint32_t r = 0; r < rows; r++) {
-                const uint32_t* rw = h_words + (size_t)r * wpr;
-                long long acc = 0;
-                for (uint32_t t = 0; t < 2u * wpr; t++) {
-                    const uint32_t word = rw[t >> 1];
-                    const int      h    = (int)(t & 1u) * 3;
-                    long long dot = 0, x3 = 0;
-                    for (int i = 0; i < 3; i++) {
-                        const uint32_t k = (word >> cw_k_shift(layout, h + i)) & 0x1Fu;
-                        const int      xv = xqr[3u * t + (uint32_t)i];
-                        dot += (long long)cw_e_lut_cpu[k] * xv;
-                        x3  += xv;
-                    }
-                    const long long v = 127 * x3 + dot;
-                    acc += ((word >> cw_sign_shift(layout, h)) & 1u) ? -v : v;
+                const uint32_t* rw = h.words + (size_t)r * h.wpr;
+                long long acc = off * sxq;
+                double yf = 0.0;
+                for (uint32_t c = 0; c < cols; c++) {
+                    const uint32_t k = cw_k_at(rw[c / 6u], (int)(c % 6u));
+                    acc += (long long)cw_e_cpu(grid, k) * xqr[c];
+                    yf  += (double)cw_value_cpu(grid, k) * h_x[(size_t)b * cols + c];
                 }
-                const double unit = (double)scale * h_sx[b] / 127.0;
+                const double unit = (double)h.scale[r] * h_sx[b] / 127.0;
                 const double yref = (double)acc * unit;
                 const double y    = h_y[(size_t)b * rows + r];
                 const double ex   = fabs(y - yref) / (1e-6 * fabs(yref) + 0.25 * unit + 1e-30);
                 if (ex > worst_exact) worst_exact = ex;
-
-                double yf = 0.0;
-                for (uint32_t c = 0; c < cols; c++)
-                    yf += (double)cw_decode_cpu(layout, rw, c) * h_x[(size_t)b * cols + c];
-                yf *= scale;
+                yf *= h.scale[r];
                 if (fabs(y - yf) > max_qerr) max_qerr = fabs(y - yf);
                 if (fabs(yf) > max_ref)      max_ref  = fabs(yf);
             }
         }
         ok = worst_exact <= 1.0;
-        printf("  %-5s layout=%s  %4ux%-5u  batch=%-3u  int-exact=%s  quant_err=%.2e (rel to max|y|)\n",
-               use_tc ? "tc" : "dp4a", layout == CW_LAYOUT_U32 ? "u32" : "u16",
-               rows, cols, batch, ok ? "ok  " : "FAIL", max_qerr / (max_ref + 1e-30));
-        free(h_xq); free(h_sx);
+        printf("  %-5s grid=%s  %4ux%-5u  batch=%-3u  int-exact=%s  quant_err=%.2e (rel to max|y|)\n",
+               use_tc ? "tc" : "dp4a", cw_grid_name(grid), rows, cols, batch,
+               ok ? "ok  " : "FAIL", max_qerr / (max_ref + 1e-30));
+        free(h_y); free(h_sx); free(h_xq);
     } else {
-        printf("  %-5s layout=%s  %4ux%-5u  batch=%-3u  skipped (not supported here)\n",
-               use_tc ? "tc" : "dp4a", layout == CW_LAYOUT_U32 ? "u32" : "u16", rows, cols, batch);
+        printf("  %-5s grid=%s  %4ux%-5u  batch=%-3u  skipped (not supported here)\n",
+               use_tc ? "tc" : "dp4a", cw_grid_name(grid), rows, cols, batch);
         ok = 1;
     }
 
     cw_int8_workspace_free(&ws);
-    CW_CUDA_WARN(cudaFree(d_words)); CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_y));
-    free(h_words); free(h_x); free(h_y);
+    free_matrix(&m); free_host_matrix(&h);
+    CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_y));
+    free(h_x);
     return ok;
 }
 
 /*
- * Fused backward check against a double-precision host reference.
- * A k mismatch only counts as an error when |g| is clearly non-zero
- * (|g| > 1e-5 · Σ|dY·X|); below that, float summation order may legitimately
- * flip the sign.  Sign bits and padding k must never change.
+ * 4. Fused backward vs a double-precision host reference.  A code mismatch
+ * only counts as an error when |g| is clearly non-zero (> 1e-5 · Σ|dY·X|);
+ * below that, float summation order may legitimately flip the sign.
+ * Padding codes and reserved bits must never change.
  */
-static int run_backward_case(int layout, uint32_t rows, uint32_t cols, uint32_t batch,
+static int run_backward_case(int grid, uint32_t rows, uint32_t cols, uint32_t batch,
                              int with_act, float lr) {
-    uint32_t wpr = cw_words_per_row(cols), padded = wpr * CW_WEIGHTS_PER_WORD;
-    uint32_t *h_words, *h_act;
-    make_random_matrix(layout, rows, cols, with_act, &h_words, &h_act);
-    const size_t n_words = (size_t)rows * wpr, n_act = ((size_t)rows * padded + 15u) / 16u;
-
-    float* h_x  = (float*)malloc((size_t)batch * cols * sizeof(float));
+    CwHostMatrix h = make_random_matrix(grid, rows, cols, with_act);
+    FiverMatrix  m = upload_matrix(&h, grid, rows, cols);
+    const size_t n_words = (size_t)rows * h.wpr;
+    float *h_x, *h_b;
+    float* d_x  = upload_random((size_t)batch * cols, -1.0f, 1.0f, &h_x);
     float* h_dy = (float*)malloc((size_t)batch * rows * sizeof(float));
-    float* h_b  = (float*)malloc(rows * sizeof(float));
-    for (size_t i = 0; i < (size_t)batch * cols; i++) h_x[i]  = ((float)(cw_rand() & 0xFFFFu) / 32768.0f) - 1.0f;
-    for (size_t i = 0; i < (size_t)batch * rows; i++) h_dy[i] = ((float)(cw_rand() & 0xFFFFu) / 32768.0f) - 1.0f;
-    for (uint32_t r = 0; r < rows; r++) h_b[r] = ((float)(cw_rand() & 0xFFFFu) / 65536.0f);
+    for (size_t i = 0; i < (size_t)batch * rows; i++) h_dy[i] = cw_randf(-1.0f, 1.0f);
     for (uint32_t b = 0; b < batch; b++) h_dy[(size_t)b * rows] = 0.0f;   /* row 0: g = 0 */
-    const float scale = 0.0371f;
-
-    uint32_t *d_words, *d_act = NULL;
-    float *d_x, *d_dy, *d_dx, *d_b;
-    CW_CUDA_CHECK(cudaMalloc(&d_words, n_words * sizeof(uint32_t)));
-    CW_CUDA_CHECK(cudaMalloc(&d_x,  (size_t)batch * cols * sizeof(float)));
+    float* d_dy;
     CW_CUDA_CHECK(cudaMalloc(&d_dy, (size_t)batch * rows * sizeof(float)));
-    CW_CUDA_CHECK(cudaMalloc(&d_dx, (size_t)batch * cols * sizeof(float)));
-    CW_CUDA_CHECK(cudaMalloc(&d_b,  rows * sizeof(float)));
-    CW_CUDA_CHECK(cudaMemcpy(d_words, h_words, n_words * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemcpy(d_x,  h_x,  (size_t)batch * cols * sizeof(float), cudaMemcpyHostToDevice));
     CW_CUDA_CHECK(cudaMemcpy(d_dy, h_dy, (size_t)batch * rows * sizeof(float), cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemcpy(d_b,  h_b,  rows * sizeof(float), cudaMemcpyHostToDevice));
-    if (with_act) {
-        CW_CUDA_CHECK(cudaMalloc(&d_act, n_act * sizeof(uint32_t)));
-        CW_CUDA_CHECK(cudaMemcpy(d_act, h_act, n_act * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    }
+    float* d_b = upload_random(rows, 0.0f, 1.0f, &h_b);
+    float* d_dx;
+    CW_CUDA_CHECK(cudaMalloc(&d_dx, (size_t)batch * cols * sizeof(float)));
 
-    FiverMatrix m = { d_words, d_act, rows, cols, wpr, scale, layout,
-                      (uint8_t)(with_act ? CW_FLAG_HAS_ACT : 0u) };
     cw_fiver_backward_step(&m, d_x, d_dy, d_dx, d_b, batch, lr, 0);
     CW_CUDA_CHECK(cudaGetLastError());
     CW_CUDA_CHECK(cudaDeviceSynchronize());
 
-    uint32_t* n_w  = (uint32_t*)malloc(n_words * sizeof(uint32_t));
-    float*    g_dx = (float*)malloc((size_t)batch * cols * sizeof(float));
-    float*    n_b  = (float*)malloc(rows * sizeof(float));
-    CW_CUDA_CHECK(cudaMemcpy(n_w,  d_words, n_words * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CW_CUDA_CHECK(cudaMemcpy(g_dx, d_dx, (size_t)batch * cols * sizeof(float), cudaMemcpyDeviceToHost));
-    CW_CUDA_CHECK(cudaMemcpy(n_b,  d_b,  rows * sizeof(float), cudaMemcpyDeviceToHost));
+    uint32_t* n_w = (uint32_t*)malloc(n_words * sizeof(uint32_t));
+    CW_CUDA_CHECK(cudaMemcpy(n_w, m.words, n_words * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    float* g_dx = download(d_dx, (size_t)batch * cols);
+    float* n_b  = download(d_b, rows);
 
-    /* dX with the old weights */
     double worst_dx = 0.0;
     for (uint32_t b = 0; b < batch; b++)
         for (uint32_t c = 0; c < cols; c++) {
             double ref = 0.0, mag = 0.0;
             for (uint32_t r = 0; r < rows; r++) {
-                float w = cw_decode_cpu(layout, h_words + (size_t)r * wpr, c);
-                if (with_act) {
-                    size_t idx = (size_t)r * padded + c;
-                    w = cw_apply_act(w, (h_act[idx >> 4] >> ((idx & 15u) * 2u)) & 3u);
-                }
-                ref += (double)w * h_dy[(size_t)b * rows + r];
-                mag += fabs((double)w * h_dy[(size_t)b * rows + r]);
+                double t = (double)h.scale[r] * cw_weight_cpu(grid, &h, r, c) * h_dy[(size_t)b * rows + r];
+                ref += t; mag += fabs(t);
             }
-            double e = fabs(g_dx[(size_t)b * cols + c] - scale * ref) / (scale * mag + 1e-30);
+            double e = fabs(g_dx[(size_t)b * cols + c] - ref) / (mag + 1e-30);
             if (e > worst_dx) worst_dx = e;
         }
 
-    /* k update, sign bits, padding */
-    uint32_t k_err = 0, k_moved = 0, k_ambig = 0, other_bits_err = 0;
+    uint32_t k_err = 0, k_moved = 0, k_ambig = 0, frozen_err = 0;
     for (uint32_t r = 0; r < rows; r++)
-        for (uint32_t wi = 0; wi < wpr; wi++) {
-            const uint32_t ow = h_words[(size_t)r * wpr + wi], nw = n_w[(size_t)r * wpr + wi];
-            uint32_t kmask = 0;
+        for (uint32_t wi = 0; wi < h.wpr; wi++) {
+            const uint32_t ow = h.words[(size_t)r * h.wpr + wi], nw = n_w[(size_t)r * h.wpr + wi];
+            if ((ow >> 30) != (nw >> 30)) frozen_err++;                 /* reserved bits */
             for (int i = 0; i < 6; i++) {
-                const uint32_t sh = cw_k_shift(layout, i), c = wi * 6u + (uint32_t)i;
-                kmask |= 0x1Fu << sh;
-                const uint32_t k_old = (ow >> sh) & 0x1Fu, k_new = (nw >> sh) & 0x1Fu;
+                const uint32_t c = wi * 6u + (uint32_t)i;
+                const uint32_t k_old = cw_k_at(ow, i), k_new = cw_k_at(nw, i);
+                if (c >= cols) { if (k_new != k_old) frozen_err++; continue; }
                 double g = 0.0, mag = 0.0;
-                if (c < cols)
-                    for (uint32_t b = 0; b < batch; b++) {
-                        g   += (double)h_dy[(size_t)b * rows + r] * h_x[(size_t)b * cols + c];
-                        mag += fabs((double)h_dy[(size_t)b * rows + r] * h_x[(size_t)b * cols + c]);
-                    }
-                const double d = (((ow >> cw_sign_shift(layout, i)) & 1u) ? -g : g) * lr;
+                for (uint32_t b = 0; b < batch; b++) {
+                    double t = (double)h_dy[(size_t)b * rows + r] * h_x[(size_t)b * cols + c];
+                    g += t; mag += fabs(t);
+                }
+                const double d = g * lr;
                 uint32_t k_exp = k_old;
                 if (d > 0.0 && k_old > 0u)  k_exp = k_old - 1u;
                 if (d < 0.0 && k_old < 31u) k_exp = k_old + 1u;
                 if (k_new != k_old) k_moved++;
                 if (k_new != k_exp) {
-                    if (c < cols && fabs(g) <= 1e-5 * mag) k_ambig++;
+                    if (fabs(g) <= 1e-5 * mag) k_ambig++;
                     else k_err++;
                 }
             }
-            if ((ow & ~kmask) != (nw & ~kmask)) other_bits_err++;
         }
 
     double worst_b = 0.0;
@@ -1365,77 +1353,60 @@ static int run_backward_case(int layout, uint32_t rows, uint32_t cols, uint32_t 
         if (e > worst_b) worst_b = e;
     }
 
-    const int ok = worst_dx < 1e-5 && k_err == 0 && other_bits_err == 0 && worst_b < 1e-5;
-    printf("  layout=%s  %4ux%-5u  batch=%-3u act=%d lr=%+.2f  dX_err=%.1e  k moved=%u/%u"
-           " wrong=%u ambiguous=%u  sign/pad bits changed=%u  bias_err=%.1e  %s\n",
-           layout == CW_LAYOUT_U32 ? "u32" : "u16", rows, cols, batch, with_act, lr,
-           worst_dx, k_moved, rows * padded, k_err, k_ambig, other_bits_err, worst_b,
-           ok ? "ok" : "FAIL");
+    const int ok = worst_dx < 1e-5 && k_err == 0 && frozen_err == 0 && worst_b < 1e-5;
+    printf("  grid=%s  %4ux%-5u  batch=%-3u act=%d lr=%+.2f  dX_err=%.1e  k moved=%u/%u"
+           " wrong=%u ambiguous=%u  pad/reserved changed=%u  bias_err=%.1e  %s\n",
+           cw_grid_name(grid), rows, cols, batch, with_act, lr, worst_dx, k_moved, rows * cols,
+           k_err, k_ambig, frozen_err, worst_b, ok ? "ok" : "FAIL");
 
-    CW_CUDA_WARN(cudaFree(d_words)); CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_dy));
-    CW_CUDA_WARN(cudaFree(d_dx));    CW_CUDA_WARN(cudaFree(d_b));
-    if (d_act) CW_CUDA_WARN(cudaFree(d_act));
-    free(h_words); free(h_act); free(h_x); free(h_dy); free(h_b); free(n_w); free(g_dx); free(n_b);
+    free_matrix(&m); free_host_matrix(&h);
+    CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_dy));
+    CW_CUDA_WARN(cudaFree(d_dx)); CW_CUDA_WARN(cudaFree(d_b));
+    free(h_x); free(h_dy); free(h_b); free(n_w); free(g_dx); free(n_b);
     return ok;
 }
 
 static int run_fiver_test(void) {
     int failures = 0;
 
-    /* 1. LUT table and shuffle decode vs. independent formula path */
-    float h_lut[32], *d_out;
-    CW_CUDA_CHECK(cudaMalloc(&d_out, 32 * sizeof(float)));
-    cw_lut_probe<<<1, 32>>>(d_out);
-    CW_CUDA_CHECK(cudaGetLastError());
-    CW_CUDA_CHECK(cudaMemcpy(h_lut, d_out, 32 * sizeof(float), cudaMemcpyDeviceToHost));
-    CW_CUDA_WARN(cudaFree(d_out));
+    printf("\n[test] value / int8 LUTs vs host formula:\n");
+    failures += !run_lut_test();
 
-    uint32_t lut_err = 0;
-    for (uint32_t k = 0; k < 32; k++)
-        if (fabsf(h_lut[k] - cw_fiver_to_float_cpu((uint8_t)k)) > 1e-6f) lut_err++;
-    printf("\n[test] shuffle LUT decode:   %u / 32 errors\n", lut_err);
-    failures += lut_err != 0;
-
-    /* 2. Fused GEMV vs. host double-precision reference.
-     *    Odd shapes exercise row padding (cols % 6 != 0) and batch tail (% BT). */
+    /* Odd shapes exercise row padding (cols % 6 != 0) and batch tails (% BT). */
     printf("[test] fused GEMV vs host reference:\n");
     const uint32_t shapes[][3] = { {37, 1001, 5}, {64, 6, 1}, {3, 7, 4}, {130, 4096, 9} };
-    for (int layout = 0; layout <= 1; layout++)
+    for (int grid = 0; grid <= 1; grid++)
         for (int s = 0; s < 4; s++)
             for (int act = 0; act <= 1; act++)
-                failures += !run_gemv_case(layout, shapes[s][0], shapes[s][1], shapes[s][2], act);
+                failures += !run_gemv_case(grid, shapes[s][0], shapes[s][1], shapes[s][2], act);
 
-    /* 3. INT8 decomposition: __dp4a GEMV and Tensor-Core GEMM. */
-    printf("[test] INT8 path (Σx-term + int8 dot) vs exact integer host reference:\n");
+    printf("[test] INT8 path vs exact integer host reference:\n");
     const uint32_t ishapes[][3] = { {37, 1001, 5}, {64, 6, 1}, {3, 7, 4}, {130, 4096, 9},
                                     {17, 97, 20}, {130, 4096, 33} };
-    for (int layout = 0; layout <= 1; layout++)
+    for (int grid = 0; grid <= 1; grid++)
         for (int s = 0; s < 6; s++)
-            failures += !run_int8_case(layout, ishapes[s][0], ishapes[s][1], ishapes[s][2], 0);
+            failures += !run_int8_case(grid, ishapes[s][0], ishapes[s][1], ishapes[s][2], 0);
     if (cw_device_has_int8_tc()) {
-        for (int layout = 0; layout <= 1; layout++)
+        for (int grid = 0; grid <= 1; grid++)
             for (int s = 0; s < 6; s++)
-                failures += !run_int8_case(layout, ishapes[s][0], ishapes[s][1], ishapes[s][2], 1);
+                failures += !run_int8_case(grid, ishapes[s][0], ishapes[s][1], ishapes[s][2], 1);
     } else {
         printf("  tc    skipped — this GPU has no INT8 Tensor Cores (needs sm_75+)\n");
     }
-
-    /* 4. Fused backward: dX + in-place STE update of the packed k values. */
-    printf("[test] fused backward (dX, STE update on packed words, bias):\n");
-    const uint32_t bshapes[][3] = { {37, 1001, 5}, {3, 7, 4}, {130, 1024, 33}, {9, 6, 1} };
-    for (int layout = 0; layout <= 1; layout++)
-        for (int s = 0; s < 4; s++)
-            failures += !run_backward_case(layout, bshapes[s][0], bshapes[s][1], bshapes[s][2],
-                                           s == 0, s == 1 ? -0.05f : 0.05f);
-
-    /* Matrices with per-weight activations must be refused by the INT8 path. */
     {
-        FiverMatrix m = { NULL, NULL, 1, 6, 1, 1.0f, CW_LAYOUT_U16, CW_FLAG_HAS_ACT };
+        FiverMatrix m = { NULL, NULL, NULL, 1, 6, 1, CW_GRID_CENTERED, CW_FLAG_HAS_ACT };
         CwInt8Workspace ws = { NULL, NULL, NULL, NULL, 96, 1, 16, 2 };
         int refused = !cw_fiver_gemv_int8(&m, NULL, NULL, &ws, 0, 0);
         printf("  act-flag matrix refused by INT8 path: %s\n", refused ? "ok" : "FAIL");
         failures += !refused;
     }
+
+    printf("[test] fused backward (dX, STE update on packed words, bias):\n");
+    const uint32_t bshapes[][3] = { {37, 1001, 5}, {3, 7, 4}, {130, 1024, 33}, {9, 6, 1} };
+    for (int grid = 0; grid <= 1; grid++)
+        for (int s = 0; s < 4; s++)
+            failures += !run_backward_case(grid, bshapes[s][0], bshapes[s][1], bshapes[s][2],
+                                           s == 0, s == 1 ? -0.05f : 0.05f);
 
     printf("TEST %s\n", failures == 0 ? "PASSED" : "FAILED");
     return failures == 0;
@@ -1461,10 +1432,8 @@ static double cw_time_ms(F launch, int iterations) {
 }
 
 static double cw_max_rel_diff(const float* d_a, const float* d_ref, size_t n) {
-    float* a = (float*)malloc(n * sizeof(float));
-    float* r = (float*)malloc(n * sizeof(float));
-    CW_CUDA_CHECK(cudaMemcpy(a, d_a,   n * sizeof(float), cudaMemcpyDeviceToHost));
-    CW_CUDA_CHECK(cudaMemcpy(r, d_ref, n * sizeof(float), cudaMemcpyDeviceToHost));
+    float* a = download(d_a, n);
+    float* r = download(d_ref, n);
     double md = 0.0, mr = 0.0;
     for (size_t i = 0; i < n; i++) {
         if (fabs((double)a[i] - r[i]) > md) md = fabs((double)a[i] - r[i]);
@@ -1475,46 +1444,40 @@ static double cw_max_rel_diff(const float* d_a, const float* d_ref, size_t n) {
 }
 
 /*
- * Benchmark all GEMV paths on one shape (u32 layout).  Time includes the
+ * Benchmark all GEMV paths on one shape (CENTERED grid).  Time includes the
  * x quantisation for the INT8 paths.  "rel err" is measured against the
  * float Fiver path, which uses the exact decoded weights.
  */
 static void run_gemv_benchmark(uint32_t rows, uint32_t cols, uint32_t batch, int iterations) {
-    uint32_t wpr = cw_words_per_row(cols);
-    uint32_t *h_words, *h_act;
-    make_random_matrix(CW_LAYOUT_U32, rows, cols, 0, &h_words, &h_act);
+    const int grid = CW_GRID_CENTERED;
+    CwHostMatrix h = make_random_matrix(grid, rows, cols, 0);
+    FiverMatrix  m = upload_matrix(&h, grid, rows, cols);
 
     float* h_wf = (float*)malloc((size_t)rows * cols * sizeof(float));
     for (uint32_t r = 0; r < rows; r++)
         for (uint32_t c = 0; c < cols; c++)
-            h_wf[(size_t)r * cols + c] = cw_decode_cpu(CW_LAYOUT_U32, h_words + (size_t)r * wpr, c);
-    float* h_x = (float*)malloc((size_t)batch * cols * sizeof(float));
-    for (size_t i = 0; i < (size_t)batch * cols; i++)
-        h_x[i] = ((float)(cw_rand() & 0xFFFFu) / 32768.0f) - 1.0f;
+            h_wf[(size_t)r * cols + c] = h.scale[r] * cw_decode_cpu(grid, h.words + (size_t)r * h.wpr, c);
+    float* h_x;
+    float* d_x = upload_random((size_t)batch * cols, -1.0f, 1.0f, &h_x);
 
     const size_t ny          = (size_t)batch * rows;
-    const size_t bytes_fiver = (size_t)rows * wpr * sizeof(uint32_t);
+    const size_t bytes_fiver = (size_t)rows * h.wpr * sizeof(uint32_t) + rows * sizeof(float);
     const size_t bytes_f32   = (size_t)rows * cols * sizeof(float);
-    uint32_t* d_words; float *d_wf, *d_x, *d_yf, *d_y32, *d_yd, *d_yt;
-    CW_CUDA_CHECK(cudaMalloc(&d_words, bytes_fiver));
-    CW_CUDA_CHECK(cudaMalloc(&d_wf,    bytes_f32));
-    CW_CUDA_CHECK(cudaMalloc(&d_x,  (size_t)batch * cols * sizeof(float)));
+    float *d_wf, *d_yf, *d_y32, *d_yd, *d_yt;
+    CW_CUDA_CHECK(cudaMalloc(&d_wf,  bytes_f32));
     CW_CUDA_CHECK(cudaMalloc(&d_yf,  ny * sizeof(float)));
     CW_CUDA_CHECK(cudaMalloc(&d_y32, ny * sizeof(float)));
     CW_CUDA_CHECK(cudaMalloc(&d_yd,  ny * sizeof(float)));
     CW_CUDA_CHECK(cudaMalloc(&d_yt,  ny * sizeof(float)));
-    CW_CUDA_CHECK(cudaMemcpy(d_words, h_words, bytes_fiver, cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemcpy(d_wf,    h_wf,    bytes_f32,   cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemcpy(d_x, h_x, (size_t)batch * cols * sizeof(float), cudaMemcpyHostToDevice));
+    CW_CUDA_CHECK(cudaMemcpy(d_wf, h_wf, bytes_f32, cudaMemcpyHostToDevice));
 
-    FiverMatrix m = { d_words, NULL, rows, cols, wpr, 1.0f, CW_LAYOUT_U32, 0 };
     CwInt8Workspace ws;
     cw_int8_workspace_alloc(&ws, cols, batch);
     dim3 block(32u * CW_GEMV_WARPS);
-    dim3 grid((rows + CW_GEMV_WARPS - 1u) / CW_GEMV_WARPS, (batch + CW_GEMV_BT - 1u) / CW_GEMV_BT);
+    dim3 grd((rows + CW_GEMV_WARPS - 1u) / CW_GEMV_WARPS, (batch + CW_GEMV_BT - 1u) / CW_GEMV_BT);
 
     const double t32 = cw_time_ms([&] {
-        cw_f32_gemv<CW_GEMV_BT><<<grid, block>>>(d_wf, d_x, d_y32, rows, cols, batch); }, iterations);
+        cw_f32_gemv<CW_GEMV_BT><<<grd, block>>>(d_wf, d_x, d_y32, rows, cols, batch); }, iterations);
     const double tf  = cw_time_ms([&] { cw_fiver_gemv_launch(&m, d_x, d_yf, batch, 0); }, iterations);
     const double td  = cw_time_ms([&] { cw_fiver_gemv_int8(&m, d_x, d_yd, &ws, 0, 0); }, iterations);
     const int    tc  = cw_device_has_int8_tc();
@@ -1537,35 +1500,25 @@ static void run_gemv_benchmark(uint32_t rows, uint32_t cols, uint32_t batch, int
     printf("\n");
 
     cw_int8_workspace_free(&ws);
-    CW_CUDA_WARN(cudaFree(d_words)); CW_CUDA_WARN(cudaFree(d_wf)); CW_CUDA_WARN(cudaFree(d_x));
-    CW_CUDA_WARN(cudaFree(d_yf));    CW_CUDA_WARN(cudaFree(d_y32));
-    CW_CUDA_WARN(cudaFree(d_yd));    CW_CUDA_WARN(cudaFree(d_yt));
-    free(h_words); free(h_wf); free(h_x);
+    free_matrix(&m); free_host_matrix(&h);
+    CW_CUDA_WARN(cudaFree(d_wf)); CW_CUDA_WARN(cudaFree(d_x));
+    CW_CUDA_WARN(cudaFree(d_yf)); CW_CUDA_WARN(cudaFree(d_y32));
+    CW_CUDA_WARN(cudaFree(d_yd)); CW_CUDA_WARN(cudaFree(d_yt));
+    free(h_wf); free(h_x);
 }
 
-/* Fused backward step timing (dX + STE update), u32 layout. */
+/* Fused backward step timing (dX + STE update), CENTERED grid. */
 static void run_backward_benchmark(uint32_t rows, uint32_t cols, uint32_t batch, int iterations) {
-    uint32_t wpr = cw_words_per_row(cols);
-    uint32_t *h_words, *h_act;
-    make_random_matrix(CW_LAYOUT_U32, rows, cols, 0, &h_words, &h_act);
-    float* h_x  = (float*)malloc((size_t)batch * cols * sizeof(float));
-    float* h_dy = (float*)malloc((size_t)batch * rows * sizeof(float));
-    for (size_t i = 0; i < (size_t)batch * cols; i++) h_x[i]  = ((float)(cw_rand() & 0xFFFFu) / 32768.0f) - 1.0f;
-    for (size_t i = 0; i < (size_t)batch * rows; i++) h_dy[i] = ((float)(cw_rand() & 0xFFFFu) / 32768.0f) - 1.0f;
-
-    const size_t bytes_fiver = (size_t)rows * wpr * sizeof(uint32_t);
-    uint32_t* d_words; float *d_x, *d_dy, *d_dx, *d_b;
-    CW_CUDA_CHECK(cudaMalloc(&d_words, bytes_fiver));
-    CW_CUDA_CHECK(cudaMalloc(&d_x,  (size_t)batch * cols * sizeof(float)));
-    CW_CUDA_CHECK(cudaMalloc(&d_dy, (size_t)batch * rows * sizeof(float)));
+    const int grid = CW_GRID_CENTERED;
+    CwHostMatrix h = make_random_matrix(grid, rows, cols, 0);
+    FiverMatrix  m = upload_matrix(&h, grid, rows, cols);
+    float *h_x, *h_dy, *h_b;
+    float* d_x  = upload_random((size_t)batch * cols, -1.0f, 1.0f, &h_x);
+    float* d_dy = upload_random((size_t)batch * rows, -1.0f, 1.0f, &h_dy);
+    float* d_b  = upload_random(rows, 0.0f, 0.0f, &h_b);
+    float* d_dx;
     CW_CUDA_CHECK(cudaMalloc(&d_dx, (size_t)batch * cols * sizeof(float)));
-    CW_CUDA_CHECK(cudaMalloc(&d_b,  rows * sizeof(float)));
-    CW_CUDA_CHECK(cudaMemcpy(d_words, h_words, bytes_fiver, cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemcpy(d_x,  h_x,  (size_t)batch * cols * sizeof(float), cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemcpy(d_dy, h_dy, (size_t)batch * rows * sizeof(float), cudaMemcpyHostToDevice));
-    CW_CUDA_CHECK(cudaMemset(d_b, 0, rows * sizeof(float)));
 
-    FiverMatrix m = { d_words, NULL, rows, cols, wpr, 1.0f, CW_LAYOUT_U32, 0 };
     const double t_full = cw_time_ms([&] {
         cw_fiver_backward_step(&m, d_x, d_dy, d_dx, d_b, batch, 0.01f, 0); }, iterations);
     const double t_upd  = cw_time_ms([&] {
@@ -1576,11 +1529,13 @@ static void run_backward_benchmark(uint32_t rows, uint32_t cols, uint32_t batch,
     printf("  dX + STE update  %9.4f ms   %7.1f GFMA/s\n", t_full, 2.0 * fma / (t_full * 1e6));
     printf("  STE update only  %9.4f ms   %7.1f GFMA/s\n", t_upd, fma / (t_upd * 1e6));
     printf("  VRAM not needed: float W %.1f MB + float grad matrix %.1f MB (packed W: %.1f MB)\n\n",
-           (double)rows * cols * 4 / 1e6, (double)rows * cols * 4 / 1e6, bytes_fiver / 1e6);
+           (double)rows * cols * 4 / 1e6, (double)rows * cols * 4 / 1e6,
+           ((double)rows * h.wpr * 4 + rows * 4) / 1e6);
 
-    CW_CUDA_WARN(cudaFree(d_words)); CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_dy));
-    CW_CUDA_WARN(cudaFree(d_dx));    CW_CUDA_WARN(cudaFree(d_b));
-    free(h_words); free(h_x); free(h_dy);
+    free_matrix(&m); free_host_matrix(&h);
+    CW_CUDA_WARN(cudaFree(d_x)); CW_CUDA_WARN(cudaFree(d_dy));
+    CW_CUDA_WARN(cudaFree(d_dx)); CW_CUDA_WARN(cudaFree(d_b));
+    free(h_x); free(h_dy); free(h_b);
 }
 
 static void print_device_info(void) {
@@ -1603,8 +1558,8 @@ static void print_device_info(void) {
 }
 
 int main(int argc, char** argv) {
-    printf("compact_weights — Symmetric Fiver Encoding\n");
-    printf("===========================================\n\n");
+    printf("compact_weights — Fiver 5-bit (centered / anchored grids)\n");
+    printf("==========================================================\n\n");
     print_device_info();
 
     int do_a = 0, do_b = 0, do_g = 0, do_w = 0, do_t = 0;

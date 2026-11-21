@@ -1,11 +1,13 @@
 """
-quant_llama.py — Fiver 5-bit quantization for LLaMA / Mistral embedding and RMSNorm layers.
+quant_llama.py — Fiver 5-bit quantization for LLaMA / Mistral weights.
 
-Target layers (unsigned / near-1.0, highest memory impact):
-  1. model.embed_tokens.weight    shape: (vocab_size, d_model)  e.g. 128K×4096 = 524M params
-  2. model.norm.weight            RMSNorm gain γ, shape: (d_model,)   naturally near 1.0
-  3. model.layers.*.input_layernorm.weight    per-layer RMSNorm
-  4. model.layers.*.post_attention_layernorm.weight
+Grid per tensor (--grid auto): centered for zero-centred weight matrices,
+anchored for positive near-1 vectors (RMSNorm γ).  One MSE-optimal scale per row.
+
+Target layers (--layers):
+  embed  model.embed_tokens.weight / lm_head.weight   e.g. 128K×4096 = 524M params
+  proj   q/k/v/o_proj, gate/up/down_proj               the bulk of all parameters
+  norm   input/post_attention/final RMSNorm γ          tiny vectors, anchored grid
 
 Usage:
   python quant_llama.py --model meta-llama/Meta-Llama-3.1-8B --dry-run
@@ -19,14 +21,21 @@ from pathlib import Path
 
 import numpy as np
 
-from fiver_core import float_to_fiver, fiver_reconstruct, quantization_error, memory_summary
+from fiver_core import bits_per_weight, float_to_fiver, memory_summary, quantization_error, save_npz
 
 # Names of target layer types (matched by substring)
 EMBED_KEYS   = ["embed_tokens.weight", "lm_head.weight"]
 NORM_KEYS    = ["layernorm.weight", "layer_norm.weight", "norm.weight",
                 "input_layernorm.weight", "post_attention_layernorm.weight",
                 "final_layernorm.weight"]
-PROJ_KEYS    = ["o_proj.weight", "down_proj.weight"]  # output projections (post-activation)
+PROJ_KEYS    = ["q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
+                "gate_proj.weight", "up_proj.weight", "down_proj.weight"]   # all linear layers
+
+
+class _ShapeOnly:
+    """Stand-in for a tensor in --dry-run: carries only the shape."""
+    def __init__(self, shape):
+        self.shape = tuple(shape)
 
 
 def _load_model_weights(model_path: str, dry_run: bool) -> dict[str, np.ndarray]:
@@ -50,8 +59,7 @@ def _load_model_weights(model_path: str, dry_run: bool) -> dict[str, np.ndarray]
             with safe_open(f, framework="np", device="cpu") as st:
                 for key in st.keys():
                     if dry_run:
-                        # Only load shapes, not data
-                        weights[key] = st.get_slice(key)[:0]  # shape probe
+                        weights[key] = _ShapeOnly(st.get_slice(key).get_shape())
                     else:
                         weights[key] = st.get_tensor(key)
         print(f"[quant_llama] loaded {len(weights)} tensors via safetensors", flush=True)
@@ -119,36 +127,22 @@ def quantize_llama(args: argparse.Namespace) -> None:
     results = {}
 
     for key in selected:
-        tensor = weights[key].astype(np.float32)
+        shape = tuple(weights[key].shape)
+        n     = int(np.prod(shape))
+        total_orig_mb  += n * 4 / 1e6
+        total_fiver_mb += n * bits_per_weight(shape) / 8 / 1e6
 
         if args.dry_run:
-            n = int(np.prod(tensor.shape)) if tensor.size > 0 else 0
-            fp32_mb  = n * 4 / 1e6
-            fiver_mb = n * 5 / 8 / 1e6
-            print(f"  [DRY] {key:50s}  shape={str(tensor.shape):20s}"
-                  f"  FP32={fp32_mb:.1f}MB → Fiver={fiver_mb:.1f}MB"
-                  f"  saving={fp32_mb - fiver_mb:.1f}MB")
-            total_orig_mb  += fp32_mb
-            total_fiver_mb += fiver_mb
+            print(memory_summary(key, shape, "auto"))
             continue
 
-        # Detect layer type — unsigned layers skip sign bits for efficiency
-        key_l      = key.lower()
-        is_norm    = any(k in key_l for k in NORM_KEYS)
-        is_embed   = any(k in key_l for k in EMBED_KEYS)
-        use_sign   = not is_norm   # RMSNorm γ is always positive, skip sign
-
-        q    = float_to_fiver(tensor, use_sign=use_sign)
-        errs = quantization_error(tensor, q)
-
-        print(memory_summary(key, tensor.shape, tensor.dtype, float(q['scale'])))
-        print(f"    L2={errs['l2_norm']:.5f}  max_err={errs['max_abs_err']:.5f}"
-              f"  rel_err={errs['mean_rel_err']:.4f}  KL={errs['kl_divergence']:.6f}"
-              f"  compression={errs['compression']:.1f}×")
-
-        total_orig_mb  += tensor.nbytes / 1e6
-        total_fiver_mb += q['k_data'].size * 5 / 8 / 1e6
-        results[key]    = q
+        tensor = np.asarray(weights[key], dtype=np.float32)
+        q      = float_to_fiver(tensor, grid=args.grid)
+        errs   = quantization_error(tensor, q)
+        print(memory_summary(key, shape, q["grid"]))
+        print(f"    rel_rmse={errs['rel_rmse']:.4f}  SQNR={errs['sqnr_db']:.1f} dB"
+              f"  max_err={errs['max_abs_err']:.5f}  compression={errs['compression']:.1f}×")
+        results[key] = q
 
     print(f"\n[quant_llama] total: {total_orig_mb:.1f} MB → {total_fiver_mb:.1f} MB"
           f"  ({total_orig_mb / max(total_fiver_mb, 0.001):.1f}× compression)")
@@ -157,19 +151,10 @@ def quantize_llama(args: argparse.Namespace) -> None:
         print("[quant_llama] dry run complete — no files written")
         return
 
-    # Save
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     for key, q in results.items():
-        safe_name = key.replace("/", "__").replace(".", "_")
-        save_path = out_dir / f"{safe_name}.npz"
-        save_dict = {
-            'k_data': q['k_data'],
-            'scale':  np.array([q['scale']], dtype=np.float32),
-        }
-        if q['sign_bits'] is not None:
-            save_dict['sign_bits'] = q['sign_bits']
-        np.savez_compressed(save_path, **save_dict)
+        save_npz(out_dir / f"{key.replace('/', '__').replace('.', '_')}.npz", q)
 
     manifest = out_dir / "manifest.txt"
     with open(manifest, "w") as f:
@@ -188,10 +173,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Fiver quantization for LLaMA/Mistral")
     ap.add_argument("--model",   required=True,
                     help="HuggingFace model ID or local path")
-    ap.add_argument("--layers",  default="embed,norm",
-                    help="Comma-separated: embed, norm, proj, all  (default: embed,norm)")
+    ap.add_argument("--layers",  default="embed,norm,proj",
+                    help="Comma-separated: embed, norm, proj, all  (default: embed,norm,proj)")
     ap.add_argument("--out",     default="./llama_fiver",
                     help="Output directory for quantized .npz files")
+    ap.add_argument("--grid",    default="auto", choices=["auto", "centered", "anchored"],
+                    help="value grid (auto: anchored for positive near-1 tensors such as "
+                         "RMSNorm, centered otherwise)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print memory savings without loading full weights")
     quantize_llama(ap.parse_args())

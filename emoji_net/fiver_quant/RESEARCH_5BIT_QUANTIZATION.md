@@ -1,6 +1,6 @@
 # 5-Bit Quantization for LLMs — Research Report
 *Recherche zum Stand der Technik und Einordnung des Fiver-Ansatzes*
-*Erstellt: 2026-06-16*
+*Erstellt: 2026-06-16 · Abschnitte 1, 6–8 überarbeitet nach Messung an SmolLM-135M*
 
 ---
 
@@ -9,9 +9,14 @@
 5-Bit-Quantisierung existiert in der Praxis — vor allem in **llama.cpp (Q5_K_M)** — ist
 aber in der akademischen PTQ-Literatur ein nahezu unbeschriebenes Blatt.
 Forschung springt direkt von 4-Bit zu sub-3-Bit-Verfahren.
-Das ist die Lücke, in die **Fiver** passt: ein strukturiertes, hardware-freundliches
-5-Bit-Encoding, das insbesondere für vorzeichenlose Layer (RMSNorm, Embedding, RWKV-W)
-optimiert ist.
+Das ist die Lücke, in die **Fiver** passt.
+
+Die Messung an echten Gewichten (Abschnitt 6) hat die ursprüngliche Annahme
+korrigiert: Große vorzeichenlose Layer gibt es in LLMs nicht — die
+Gewichtsmatrizen sind nullzentrierte Glockenkurven. Fiver um 0 zentriert
+(`v = ∓2^(−m/4)`, Code 16 = 0, Vorzeichen im MSB) trifft diese Verteilung
+und ist mit 5,333 bpw gleichauf mit uniformem int5; das ursprüngliche,
+bei 1 verankerte Gitter bleibt für positive Vektoren wie RMSNorm γ.
 
 ---
 
@@ -145,106 +150,87 @@ Neuestes Paper zur RWKV-Quantisierung:
 - Ergebnis: RWKV-6-14B → **3-Bit mit <1% Accuracy-Verlust**, 2.14× Speed-up
 - Getestete Bit-Breiten: **3 und 4 bit** — 5-Bit nicht untersucht
 
-**→ Fiver bei 5-Bit für W-Vektoren ist unerforscht und wohlmotiviert.**
+**→ Fiver bei 5-Bit für W-Vektoren ist unerforscht** — aber die Vektoren sind klein
+(n_embd pro Layer), die Speicherersparnis ist daher gering (siehe Abschnitt 6).
 
 ---
 
-## 6. Einordnung des Fiver-Ansatzes
+## 6. Messung an echten Gewichten (SmolLM-135M)
 
-### 6.1 Speicherformat: Fiver-Word (3-per-uint16)
+Modell: `HuggingFaceTB/SmolLM-135M` (LLaMA-Architektur, 30 Layer, RMSNorm).
+Werkzeug: `analyze_weights.py`. Fehler = relativer RMS-Fehler ‖x − q‖ / ‖x‖.
 
-Drei k-Werte teilen sich ein 16-Bit-Wort mit **einem gemeinsamen Vorzeichenbit**:
+### 6.1 Verteilung
 
-```
-┌────┬─────────┬─────────┬─────────┐
-│ S  │   k2    │   k1    │   k0    │
-│ 15 │ 14 – 10 │  9 – 5  │  4 – 0  │
-└────┴─────────┴─────────┴─────────┘
+| Tensor | Mittel/σ | negativ | Kurtosis (Gauß 3) | max/σ |
+|---|---|---|---|---|
+| L15 q / gate / down_proj | ≈ 0 | 50 % | 4–5 | 11–13 |
+| L15 v_proj | ≈ 0 | 50 % | 3,3 | 5 |
+| L0 q_proj | ≈ 0 | 50 % | 55 | 52 |
+| embed_tokens | ≈ 0 | 51 % | 15 | 21 |
+| RMSNorm γ | 3–4,6 | 0 % | – | – |
 
-S   = shared sign für alle drei Gewichte im Wort
-      0 → alle positiv,  1 → alle negativ
-k ∈ [0..31]:  w(k) = 1 ± 2^(−mag(k)/4)
-```
+Lehrbuch bestätigt: nullzentriert, im Kern gaußförmig, leicht schwere Ränder,
+einzelne starke Ausreißer (Layer 0, Embedding). Vorzeichen in Triplets sind
+exakt zufällig verteilt (25 % gleiches Vorzeichen, wie bei Zufall).
+Vorzeichenlose Tensoren (RMSNorm) sind ~0,03 % der Parameter.
 
-Effektiver Speicherbedarf: **16 bit / 3 Werte = 5.333 bpw → 6.0× Kompression vs FP32**
+### 6.2 Ergebnisse
 
-Das gemeinsame VZ-Bit ist eine bewusste Approximation:
-- **Unsigned Layer** (RMSNorm, RWKV-W): S = 0 immer → kein Informationsverlust
-- **Signed Layer** (Embeddings, Projektionen): Mehrheitsentscheid über das Triplet;
-  das Minoritäts-Element wird mit falschem Vorzeichen rekonstruiert
+| Variante | Bit/Gewicht | L15 gate | L29 down | L0 q (Ausreißer) |
+|---|---|---|---|---|
+| Fiver original 1 ± 2^(−m/4), VZ pro Triplet | 5,33 | **100 %** | 100 % | – |
+| Fiver original + VZ pro Gewicht | 6,4 | 5,4 % | 6,4 % | 12,7 % |
+| **Fiver zentriert, Code 16 = 0** | **5,33** | **6,1 %** | **6,9 %** | 12,6 % |
+| Fiver zentriert ohne Null-Code | 5,33 | 7,7 % | 8,8 % | 21 % |
+| uniform int5 | 5,33 | 6,2 % | 7,0 % | 11,9 % |
+| Fiver zentriert 6 Bit (±2^(−m/4), m < 32) | 6,4 | 4,8 % | 4,9 % | **4,6 %** |
+| uniform int6 | 6,4 | **3,2 %** | **3,7 %** | 6,3 % |
 
-Rekonstruktion pro Wort:
-```python
-sign  = -1.0 if (word >> 15) else +1.0
-k0    =  word        & 0x1F
-k1    = (word >>  5) & 0x1F
-k2    = (word >> 10) & 0x1F
-w_i   = sign * scale * fiver_values[k_i]   # für i in {0, 1, 2}
-```
+Skalierung (Fiver 5 Bit + VZ, L15 gate): max pro Tensor 29 % · 2^E pro Tensor
+8,9 % · 2^E pro Zeile 7,0 % · float pro Zeile 5,4 %. Den Gewinn bringt die
+MSE-optimale Wahl; die 2^n-Einschränkung kostet pro Zeile 15–35 % mehr Fehler
+und spart keine Rechenzeit (Skala einmal pro Ausgabewert).
 
-### 6.2 Was Fiver anders macht
-
-| Eigenschaft           | llama.cpp Q5_K      | APoT              | Fiver                          |
-|-----------------------|---------------------|-------------------|-------------------------------|
-| Eff. Bit-Breite       | 5.5 – 5.7 bpw       | 4 (primär)        | **5.333 bpw** (16/3)          |
-| Kompression vs FP32   | 5.6×                | ~8×               | **6.0×**                      |
-| Encoding              | Uniform + Scale     | Σ 2^(-i)          | 1 ± 2^(-k/4), monoton         |
-| Anker                 | keiner              | keiner            | w(k=15)=1.0 explizit          |
-| Unsigned-Modus        | nein                | nein              | ja (use_sign=False, S=0)      |
-| Vorzeichen-Granularität | pro Block          | pro Wert          | **pro Triplet** (shared S)    |
-| Ziel-Layer            | alle Linear         | CNN-Gewichte      | Embeddings, Norms, RWKV-W     |
-| Hardware              | GGML/CPU            | ASIC-optimiert    | CUDA + CPU (diese Arbeit)     |
-| GGUF-Integration      | ja (nativ)          | nein              | Q5_FIVER=0x0105 vorgeschlagen |
-
-### 6.2 Wo Fiver am besten passt (nach Recherche)
-
-1. **RMSNorm / LayerNorm Gains** (LLaMA, Mistral, Falcon)
-   - Werte bei 1.0 ± kleines δ → Fiver-Mitte k=15 ist natürlicher Ruhepunkt
-   - Typisch: d_model=4096 Werte × 32 Layer = 131K Parameter pro Modell
-   - Einsparung: FP32 → 5-bit = **6.4× Kompression**
-
-2. **Embedding-Gewichte** (embed_tokens, lm_head)
-   - LLaMA-3.1-8B: 128K × 4096 = 524M Parameter = **2 GB in FP32**
-   - Fiver-Word: ~333 MB (6.0× Kompression, 16/3 bpw)
-   - Q5_K_M lässt diese Layer bei FP16 → Fiver füllt diese Lücke
-
-3. **RWKV time-decay W-Vektoren**
-   - Exponentialverteilung in [0,1) → untere Fiver-Hälfte (k ∈ [0..15])
-   - RWKVQuant (2025) zeigt Quantisierbarkeit; 5-Bit nicht getestet
-
-4. **Ausgabe-Projektionen** (o_proj, down_proj)
-   - Post-Aktivierungs-Gewichte: oft vorzeichenlos oder schwach bipolar
-   - llama.cpp quantisiert diese mit Q5_K_M; Fiver bietet strukturierte Alternative
+6 Bit (anchored, δ/16): RMSNorm L29 von 3,5 % auf 0,46 %; Projektionen nur ~3 %.
+Die frühere Idee „Bit 5 = δ/4“ liefert nur 48 verschiedene Werte.
 
 ---
 
-## 7. Kompressionsraten im Überblick
+## 7. Gewähltes Format: Fiver zentriert
 
 ```
-Format        Bits    vs FP32   Ppl-Delta (7–8B Modell)
-──────────────────────────────────────────────────────────
-FP32          32      1.0×      Referenz (0.0)
-FP16          16      2.0×      ~0.0
-Q8_0           8.5   3.8×      ~0.0
-Q6_K           6.6   4.8×      +0.16%
-Q5_K_M         5.7   5.6×      +0.40%   ← Fiver-Zielbereich
-Fiver-Word     5.333 6.0×      TBD (triplet-sign approx.)
-Q4_K_M         4.9   6.6×      +1.20%
-RTN W4A16      4.0   8.0×      +~2%
-GPTQ W4A16     4.0   8.0×      +1.5%
-AWQ W4A16      4.0   8.0×      +1.2%
-QuIP# W3       3.0  10.7×      +~2% (besser als RTN)
-SqueezeLLM W3  3.0  10.7×      +0.67 ppl abs.
+v(k) = −2^(−k/4)        k =  0..15     (−1.000 … −0.074)
+v(16) = 0
+v(k) = +2^(−(31−k)/4)   k = 17..31     (+0.088 … +1.000)
+x[r, c] = scale[r] · v(k)              eine float-Skala pro Zeile (MSE-optimal)
+
+uint32: │ r │ r │ k5 │ k4 │ k3 │ k2 │ k1 │ k0 │   k_i an Bit 5i, Bits 30-31 reserviert
+        6 Codes pro Wort → 5,333 bpw + 32 Bit pro Zeile; Zeilen mit Code 16 aufgefüllt
 ```
 
-**Fiver-Word positioniert sich zwischen Q5_K_M und Q4_K_M**: 6.0× Kompression
-bei 5.333 bpw (16 bit / 3 Werte), mit word-aligntem Speicher für GPU-Effizienz.
-Der Overhead gegenüber tight-packed 5.0 bpw beträgt nur 6.7% mehr Speicher
-(5.333 vs 5.0 bpw), dafür sind Lesezugriffe natürlich wort-aligned.
+- Vorzeichen = MSB von k, kein Vorzeichen-Bit, kein geteiltes Vorzeichen.
+- Streng monoton in k: STE-Update k ∓ 1, Vorzeichenwechsel über Code 16.
+- int8: e = rn(127·v) (−127 … −9, 0, 11 … 127, alle verschieden); `__dp4a(E, Xq, acc)`
+  ohne Σx-Term, eine MMA auf den Tensor Cores.
+- Das ursprüngliche Gitter bleibt als `anchored` (`w = 1 ∓ 2^(−m/4)`, Code 0 = 0)
+  für positive Tensoren mit Mittel > σ; `--grid auto` probiert dann beide.
+  int8: w = 1 + e/127, der Σx-Term ist eine Zahl pro Eingabezeile.
+- GGUF-Typ 0x0105 (centered) / 0x0106 (anchored).
+
+## 7.1 Offene Optionen
+
+- 6-Bit-Codes (5 pro uint32, 6,4 bpw): lohnt bei Ausreißer-Tensoren (L0) und Norm-Vektoren.
+- Gitter pro Tensor nach Kurtosis wählen (uniform bei Gauß, Fiver-Log bei Ausreißern):
+  die Kernels tauschen nur die 32-Werte-Tabelle.
+- Blockskalen (z. B. 32 Gewichte wie Q5_K) statt Zeilenskalen: nicht gemessen.
+- Perplexity-Messung mit Forward-Pass steht aus; alle Zahlen hier sind Gewichtsraum-Fehler.
 
 ---
 
 ## 8. Quellen
+
+- [SmolLM-135M — Hugging Face](https://huggingface.co/HuggingFaceTB/SmolLM-135M) (Messgrundlage Abschnitt 6)
 
 - [Which Quantization Should I Use? llama.cpp on Llama-3.1-8B (arXiv:2601.14277)](https://arxiv.org/html/2601.14277v1)
 - [llama.cpp k-quants PR #1684 (ikawrakow)](https://github.com/ggml-org/llama.cpp/pull/1684)

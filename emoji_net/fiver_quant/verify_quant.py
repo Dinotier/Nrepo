@@ -3,7 +3,7 @@ verify_quant.py — Validate Fiver quantization quality against original weights
 
 Compares each .npz produced by quant_llama.py / quant_rwkv.py against the
 source model and reports:
-  - Per-layer: L2, max_abs_err, mean_rel_err, KL divergence, compression ratio
+  - Per-layer: L2, max_abs_err, relative RMS error, SQNR, compression ratio
   - Per-layer: histogram of k_data distribution (shows if Fiver range is well used)
   - Global summary table sorted by worst relative error
   - Perplexity estimate delta (token-level logit shift proxy, no forward pass needed)
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fiver_core import fiver_reconstruct, quantization_error, FIVER_VALUES
+from fiver_core import bits_per_weight, fiver_reconstruct, load_npz, quantization_error
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ def _k_histogram(k_data: np.ndarray, bins: int = 8) -> str:
     bar    = "".join("█" * int(g / max_g * bar_w) or "▏" for g in groups)
     lo_pct = counts[:16].sum() / max(counts.sum(), 1)
     hi_pct = counts[16:].sum() / max(counts.sum(), 1)
-    return f"k-hist[low={lo_pct:.0%}|high={hi_pct:.0%}]: [{bar}]"
+    return f"k-hist[k<16 {lo_pct:.0%} | k≥16 {hi_pct:.0%}]: [{bar}]"
 
 
 def _logit_shift_proxy(original: np.ndarray, reconstructed: np.ndarray) -> float:
@@ -123,46 +123,33 @@ def _logit_shift_proxy(original: np.ndarray, reconstructed: np.ndarray) -> float
 def _verify_single(name: str, orig: np.ndarray, npz_path: Path) -> dict | None:
     """Load one .npz, reconstruct, compare against original. Returns metrics dict."""
     try:
-        d = np.load(str(npz_path), allow_pickle=False)
+        q = load_npz(npz_path)
     except Exception as exc:
         print(f"  [SKIP] {name}: cannot load {npz_path}: {exc}", file=sys.stderr)
         return None
 
-    q = {
-        'k_data':    d['k_data'],
-        'scale':     float(d['scale'][0]) if d['scale'].ndim > 0 else float(d['scale']),
-        'sign_bits': d['sign_bits'] if 'sign_bits' in d else None,
-        'shape':     d['k_data'].shape,
-        'dtype':     np.float32,
-    }
-
     orig_f32 = orig.astype(np.float32)
-    recon    = fiver_reconstruct(q)
-
-    if orig_f32.shape != recon.shape:
-        # Shape mismatch — try flattening both to compare
-        if orig_f32.size == recon.size:
-            recon = recon.reshape(orig_f32.shape)
-        else:
-            print(f"  [SKIP] {name}: shape mismatch orig={orig_f32.shape} recon={recon.shape}",
-                  file=sys.stderr)
-            return None
-
-    errs = quantization_error(orig_f32, q)
+    if orig_f32.shape != tuple(q['shape']):
+        print(f"  [SKIP] {name}: shape mismatch orig={orig_f32.shape} quant={q['shape']}",
+              file=sys.stderr)
+        return None
+    recon = fiver_reconstruct(q)
+    errs  = quantization_error(orig_f32, q)
 
     return {
         'name':         name,
         'shape':        orig_f32.shape,
         'n':            orig_f32.size,
-        'l2':           errs['l2_norm'],
+        'grid':         q['grid'],
+        'l2':           float(np.sqrt(((orig_f32 - recon) ** 2).mean())),
         'max_err':      errs['max_abs_err'],
-        'rel_err':      errs['mean_rel_err'],
-        'kl':           errs['kl_divergence'],
+        'rel_err':      errs['rel_rmse'],
+        'sqnr':         errs['sqnr_db'],
         'compression':  errs['compression'],
         'logit_proxy':  _logit_shift_proxy(orig_f32, recon),
         'k_hist':       _k_histogram(q['k_data']),
         'orig_mb':      orig_f32.nbytes / 1e6,
-        'fiver_mb':     q['k_data'].size * 5 / 8 / 1e6,
+        'fiver_mb':     orig_f32.size * bits_per_weight(q['shape']) / 8 / 1e6,
     }
 
 
@@ -208,9 +195,9 @@ def verify(args: argparse.Namespace) -> None:
 
         all_results.append(result)
         r = result
-        print(f"  {r['name'][:50]:50s}  shape={str(r['shape']):20s}")
+        print(f"  {r['name'][:50]:50s}  shape={str(r['shape']):20s}  grid={r['grid']}")
         print(f"    L2={r['l2']:.5f}  max_err={r['max_err']:.5f}"
-              f"  rel_err={r['rel_err']:.4f}  KL={r['kl']:.6f}"
+              f"  rel_err={r['rel_err']:.4f}  SQNR={r['sqnr']:.1f} dB"
               f"  compression={r['compression']:.1f}×  proxy={r['logit_proxy']:.4f}")
         print(f"    {r['k_hist']}")
 
@@ -227,18 +214,18 @@ def verify(args: argparse.Namespace) -> None:
     sorted_r = sorted(all_results, key=lambda r: r['rel_err'], reverse=True)
     top_n    = args.top if args.top > 0 else len(sorted_r)
     print(f"\nWorst {top_n} layers by mean relative error:\n")
-    header = f"{'layer name':50s}  {'rel_err':>8}  {'KL':>10}  {'compress':>8}  {'proxy':>8}"
+    header = f"{'layer name':50s}  {'rel_err':>8}  {'SQNR dB':>10}  {'compress':>8}  {'proxy':>8}"
     print(header)
     print("-" * len(header))
     for r in sorted_r[:top_n]:
-        print(f"  {r['name'][:48]:48s}  {r['rel_err']:8.4f}  {r['kl']:10.6f}"
+        print(f"  {r['name'][:48]:48s}  {r['rel_err']:8.4f}  {r['sqnr']:10.1f}"
               f"  {r['compression']:8.1f}×  {r['logit_proxy']:8.4f}")
 
     # Aggregate statistics
     total_orig_mb  = sum(r['orig_mb']  for r in all_results)
     total_fiver_mb = sum(r['fiver_mb'] for r in all_results)
     mean_rel       = np.mean([r['rel_err']      for r in all_results])
-    mean_kl        = np.mean([r['kl']           for r in all_results])
+    mean_sqnr      = np.mean([r['sqnr']         for r in all_results])
     mean_proxy     = np.mean([r['logit_proxy']  for r in all_results])
     worst_rel      = max(r['rel_err'] for r in all_results)
     worst_l2       = max(r['l2']      for r in all_results)
@@ -250,7 +237,7 @@ def verify(args: argparse.Namespace) -> None:
     print(f"  mean rel err  : {mean_rel:.4f}")
     print(f"  worst rel err : {worst_rel:.4f}")
     print(f"  worst L2      : {worst_l2:.5f}")
-    print(f"  mean KL div   : {mean_kl:.6f}")
+    print(f"  mean SQNR     : {mean_sqnr:.1f} dB")
     print(f"  mean logit proxy: {mean_proxy:.4f}  (weight-space proxy; ≈0 ideal)")
     print()
     print("NOTE: True perplexity delta requires a calibration corpus + forward pass.")

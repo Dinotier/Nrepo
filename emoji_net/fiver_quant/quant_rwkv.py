@@ -4,9 +4,11 @@ quant_rwkv.py — Fiver 5-bit quantization for RWKV time-decay W vectors.
 RWKV architecture uses a learned per-channel exponential time decay:
     state_t = exp(-exp(W)) * state_{t-1} + K_t * V_t
 
-W values live in (-∞, 0] but in practice concentrate near [−5, 0] so that
-exp(-exp(W)) ∈ [0, 1).  This makes them ideal for Fiver's lower half
-(k ∈ [0..15], w ∈ [0..1)), since the relevant range is unsigned and bounded.
+W itself is a signed real number (the decay rate exp(-exp(W)) is what lies
+in (0, 1)), so it is quantised on the centered grid like any other signed
+tensor; --grid auto picks anchored only for positive tensors clustered near
+a non-zero value.  These are per-channel vectors: tiny compared with the
+weight matrices, so the memory saving here is small.
 
 Target tensors (matched by substring):
   - time_decay      RWKV-4/5: shape (n_head,) or (n_embd,)
@@ -26,13 +28,19 @@ from pathlib import Path
 
 import numpy as np
 
-from fiver_core import float_to_fiver, fiver_reconstruct, quantization_error, memory_summary
+from fiver_core import bits_per_weight, float_to_fiver, memory_summary, quantization_error, save_npz
 
 # Layer substrings for each logical group
 DECAY_KEYS = ["time_decay", "att.time_decay", "time_decay_w1", "time_decay_w2"]
 MIX_KEYS   = ["time_mix_k", "time_mix_v", "time_mix_r", "time_mix_g", "time_mix_w",
                "ffn.time_mix", "att.time_mix"]
 BONUS_KEYS = ["time_first", "time_faaaa"]   # RWKV-5/6 bonus / shift terms
+
+
+class _ShapeOnly:
+    """Stand-in for a tensor in --dry-run: carries only the shape."""
+    def __init__(self, shape):
+        self.shape = tuple(shape)
 
 
 def _load_rwkv_weights(model_path: str, dry_run: bool) -> dict[str, np.ndarray]:
@@ -63,7 +71,8 @@ def _load_rwkv_weights(model_path: str, dry_run: bool) -> dict[str, np.ndarray]:
             for f in st_files:
                 with safe_open(f, framework="np", device="cpu") as st:
                     for key in st.keys():
-                        weights[key] = st.get_slice(key)[:0] if dry_run else st.get_tensor(key)
+                        weights[key] = (_ShapeOnly(st.get_slice(key).get_shape()) if dry_run
+                                        else st.get_tensor(key))
             print(f"[quant_rwkv] loaded {len(weights)} tensors via safetensors", flush=True)
             return weights
     except ImportError:
@@ -85,7 +94,8 @@ def _load_rwkv_weights(model_path: str, dry_run: bool) -> dict[str, np.ndarray]:
             weights = {}
             for k, v in ckpt.items():
                 if hasattr(v, "detach"):
-                    weights[k] = v.detach().float().numpy() if not dry_run else np.empty(0)
+                    weights[k] = (_ShapeOnly(v.shape) if dry_run
+                                  else v.detach().float().numpy())
             print(f"[quant_rwkv] loaded {len(weights)} tensors via torch.load", flush=True)
             return weights
         except ImportError:
@@ -170,42 +180,27 @@ def quantize_rwkv(args: argparse.Namespace) -> None:
     results: dict = {}
 
     for key in selected:
-        tensor = weights[key].astype(np.float32)
-        key_l  = key.lower()
+        shape = tuple(weights[key].shape)
+        n     = int(np.prod(shape))
+        total_orig_mb  += n * 4 / 1e6
+        total_fiver_mb += n * bits_per_weight(shape) / 8 / 1e6
 
         if args.dry_run:
-            n = int(np.prod(tensor.shape)) if tensor.size > 0 else 0
-            fp32_mb  = n * 4 / 1e6
-            fiver_mb = n * 5 / 8 / 1e6
-            print(f"  [DRY] {key:55s}  shape={str(tensor.shape):15s}"
-                  f"  FP32={fp32_mb:.3f}MB → Fiver={fiver_mb:.3f}MB"
-                  f"  saving={fp32_mb - fiver_mb:.3f}MB")
-            total_orig_mb  += fp32_mb
-            total_fiver_mb += fiver_mb
+            print(memory_summary(key, shape, "auto"))
             continue
 
-        # RWKV time-decay W: values in (-∞,0], unsigned magnitude matters more
-        # than sign → use_sign=False keeps the lower half of Fiver (k∈[0..15])
-        # which maps well onto the [0,1) decay-rate range after exp(-exp(·)).
-        is_decay = any(k in key_l for k in DECAY_KEYS)
-        use_sign = not is_decay
+        tensor = np.asarray(weights[key], dtype=np.float32)
+        q      = float_to_fiver(tensor, grid=args.grid)
+        errs   = quantization_error(tensor, q)
+        print(memory_summary(key, shape, q["grid"]))
+        print(f"    rel_rmse={errs['rel_rmse']:.4f}  SQNR={errs['sqnr_db']:.1f} dB"
+              f"  max_err={errs['max_abs_err']:.5f}")
 
-        q    = float_to_fiver(tensor, use_sign=use_sign)
-        errs = quantization_error(tensor, q)
-
-        print(memory_summary(key, tensor.shape, tensor.dtype, float(q['scale'])))
-        print(f"    L2={errs['l2_norm']:.5f}  max_err={errs['max_abs_err']:.5f}"
-              f"  rel_err={errs['mean_rel_err']:.4f}  KL={errs['kl_divergence']:.6f}"
-              f"  compression={errs['compression']:.1f}×")
-
-        if is_decay and tensor.size >= 4:
+        if any(k in key.lower() for k in DECAY_KEYS) and tensor.size >= 4:
             da = _rwkv_decay_analysis(tensor)
             print(f"    decay_rate ∈ [{da['decay_min']:.4f}, {da['decay_max']:.4f}]"
                   f"  mean={da['decay_mean']:.4f}  near_zero={da['near_zero_frac']:.2%}")
-
-        total_orig_mb  += tensor.nbytes / 1e6
-        total_fiver_mb += q['k_data'].size * 5 / 8 / 1e6
-        results[key]    = q
+        results[key] = q
 
     print(f"\n[quant_rwkv] total: {total_orig_mb:.3f} MB → {total_fiver_mb:.3f} MB"
           f"  ({total_orig_mb / max(total_fiver_mb, 1e-6):.1f}× compression)")
@@ -214,21 +209,10 @@ def quantize_rwkv(args: argparse.Namespace) -> None:
         print("[quant_rwkv] dry run complete — no files written")
         return
 
-    # ── Save ─────────────────────────────────────────────────────────────────
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     for key, q in results.items():
-        safe_name = key.replace("/", "__").replace(".", "_")
-        save_path = out_dir / f"{safe_name}.npz"
-        save_dict: dict = {
-            'k_data': q['k_data'],
-            'scale':  np.array([q['scale']], dtype=np.float32),
-            'shape':  np.array(list(q['shape']), dtype=np.int64),
-        }
-        if q['sign_bits'] is not None:
-            save_dict['sign_bits'] = q['sign_bits']
-        np.savez_compressed(save_path, **save_dict)
+        save_npz(out_dir / f"{key.replace('/', '__').replace('.', '_')}.npz", q)
 
     manifest = out_dir / "manifest.txt"
     with open(manifest, "w") as f:
@@ -251,6 +235,8 @@ if __name__ == "__main__":
                     help="Comma-separated: decay, mix, bonus, all  (default: decay,mix)")
     ap.add_argument("--out",     default="./rwkv_fiver",
                     help="Output directory for quantized .npz files")
+    ap.add_argument("--grid",    default="auto", choices=["auto", "centered", "anchored"],
+                    help="value grid (auto: anchored for positive near-1 tensors, else centered)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print memory savings without loading full weights")
     quantize_rwkv(ap.parse_args())
