@@ -86,8 +86,15 @@ class FiverLayer:
     # ── Parameter update ─────────────────────────────────────────────────
 
     def step(self, lr: float):
-        """STE discrete update: k -= sign(accumulated_grad), saturating [0,31]."""
-        delta_k = np.sign(self._grad_k * lr).astype(np.int16)
+        """STE discrete update: k -= sign(σ · grad), saturating [0,31].
+
+        w = σ · f(k) with f increasing, so ∂L/∂k has the sign of σ · ∂L/∂w.
+        Same rule as cw_fiver_ste_update in compact_weights.cu.
+        """
+        g = self._grad_k * lr
+        if self.use_sign and self.sign_bits is not None:
+            g = np.where(self.sign_bits, -g, g)
+        delta_k = np.sign(g).astype(np.int16)
         self.k_data = np.clip(
             self.k_data.astype(np.int16) - delta_k, 0, 31
         ).astype(np.uint8)
