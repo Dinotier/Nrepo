@@ -7,9 +7,11 @@ Code k ∈ [0..31], two value grids (identical to compact_weights.cu):
                        signed weights, sign = MSB of k, no sign bits
   anchored (original): w(k) = 1 − 2^(−k/4) for k < 16,  1 + 2^(−(31−k)/4) for k ≥ 16
                        positive weights in [0, 2], dense around 1
+  magic:               like centered, magnitude = float_bits(0x3F800000 − (m << 21))
+                       (shift + subtract, no table; exact in fp16 and int8)
 
 Both grids are strictly increasing in k.  Effective weight W = scale · v(k)
-with a fixed per-layer scale (centered: 2/√in_dim, anchored: 1).
+with a fixed per-layer scale (centered/magic: 2/√in_dim, anchored: 1).
 
 STE update rule: k −= sign(lr · ∂L/∂W), saturating at [0, 31].
 One integer increment/decrement per weight per step; on the centered grid a
@@ -21,7 +23,10 @@ _DELTA = 2.0 ** (-np.arange(16) / 4.0)
 ANCHORED = np.r_[1.0 - _DELTA, (1.0 + _DELTA)[::-1]].astype(np.float32)
 CENTERED = (ANCHORED - 1.0).astype(np.float32)
 CENTERED[16] = 0.0
-GRIDS = {"centered": CENTERED, "anchored": ANCHORED}
+_m = np.arange(16, dtype=np.uint32)
+_MAG = (np.uint32(0x3F800000) - (_m << 21)).view(np.float32)
+MAGIC = np.r_[-_MAG, 0.0, _MAG[:15][::-1]].astype(np.float32)
+GRIDS = {"centered": CENTERED, "anchored": ANCHORED, "magic": MAGIC}
 
 
 def fiver_to_float(k: np.ndarray, grid: str = "centered") -> np.ndarray:
@@ -45,7 +50,7 @@ class FiverLayer:
         self.out_dim = out_dim
         self.act     = act
         self.grid    = grid
-        self.scale   = np.float32(2.0 / np.sqrt(in_dim) if grid == 'centered' else 1.0)
+        self.scale   = np.float32(1.0 if grid == 'anchored' else 2.0 / np.sqrt(in_dim))
 
         rng = np.random.default_rng(seed)
         # Codes 12..20: centered → small weights around 0, anchored → around 1.0

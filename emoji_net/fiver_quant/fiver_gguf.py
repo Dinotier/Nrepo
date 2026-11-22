@@ -12,7 +12,7 @@ Storage per tensor (identical to FiverMatrix in compact_weights.cu):
     └────┴────┴───────┴───────┴───────┴───────┴───────┴───────┘
 
   Rows (last dimension = columns) are padded to a multiple of 6 with the
-  grid's zero code (16 centered, 0 anchored).  Row r starts at word
+  grid's zero code (16 centered/magic, 0 anchored).  Row r starts at word
   r · ceil(cols/6).  Value: x[r, c] = scale[r] · v_grid(k).
 
   Tensor data block (32-byte aligned):
@@ -25,6 +25,7 @@ Storage per tensor (identical to FiverMatrix in compact_weights.cu):
 GGUF type ids (not in llama.cpp; future patches can detect them):
   0x0105  Q5_FIVER_C   centered grid   v(k) = ∓2^(−m/4), code 16 = 0
   0x0106  Q5_FIVER_A   anchored grid   w(k) = 1 ∓ 2^(−m/4)
+  0x0107  Q5_FIVER_M   magic grid      |v| = float_bits(0x3F800000 − (m << 21)), code 16 = 0
 
 Usage:
   python fiver_gguf.py --manifest ./llama_fiver/manifest.txt --out ./llama_fiver.gguf
@@ -47,7 +48,7 @@ GGUF_ALIGNMENT = 32
 GGUF_TYPE_UINT32 = 4
 GGUF_TYPE_STRING = 8
 
-GGML_TYPE_Q5_FIVER = {"centered": 0x0105, "anchored": 0x0106}
+GGML_TYPE_Q5_FIVER = {"centered": 0x0105, "anchored": 0x0106, "magic": 0x0107}
 
 
 def _gguf_str(s: str) -> bytes:
@@ -129,7 +130,10 @@ def convert_to_gguf(args: argparse.Namespace) -> None:
                           "type 0x0105: v=-2^(-k/4) k<16, v(16)=0, v=+2^(-(31-k)/4) k>16")
     kv += _gguf_kv_string("fiver.grid.anchored",
                           "type 0x0106: w=1-2^(-k/4) k<16, w=1+2^(-(31-k)/4) k>=16")
-    n_kv = 7
+    kv += _gguf_kv_string("fiver.grid.magic",
+                          "type 0x0107: m=k (k<16) or 31-k; |v|=float_bits(0x3F800000-(m<<21)); "
+                          "sign=-1 for k<16; v(16)=0")
+    n_kv = 8
 
     def _align(n: int) -> int:
         return (n + GGUF_ALIGNMENT - 1) // GGUF_ALIGNMENT * GGUF_ALIGNMENT

@@ -8,6 +8,7 @@ For every selected tensor:
      MSE-optimal scale per row, for
         Fiver centered  5 bit   v = ∓2^(−m/4), code 16 = 0
         Fiver anchored  5 bit   w = 1 ∓ 2^(−m/4)  (only for tensors with mean > σ)
+        Fiver magic     5 bit   |v| = float_bits(0x3F800000 − (m << 21))
         uniform int5    5 bit   −15..15
      and with --extended also the 6-bit variants (Fiver ±2^(−m/4), m < 32; int6).
   3. Which grid --grid auto would pick, and how the codes of that grid are used.
@@ -122,6 +123,8 @@ def analyze_tensor(name: str, x: np.ndarray, extended: bool) -> dict:
         e = res["err"][f"Fiver {grid}"] = _rel(X, fiver_reconstruct(q))
         if best is None or e < best[0]:
             best = (e, grid, q)
+    q = float_to_fiver(X, grid="magic", quiet=True)
+    res["err"]["Fiver magic"] = _rel(X, fiver_reconstruct(q))
     res["auto"] = best[1]
     res["k_usage"] = np.bincount(best[2]["k_data"].ravel(), minlength=32) / f.size
     for label, (V, bits) in EXTRA_GRIDS.items():

@@ -235,7 +235,7 @@ if __name__ == "__main__":
                     help="Comma-separated: decay, mix, bonus, all  (default: decay,mix)")
     ap.add_argument("--out",     default="./rwkv_fiver",
                     help="Output directory for quantized .npz files")
-    ap.add_argument("--grid",    default="auto", choices=["auto", "centered", "anchored"],
+    ap.add_argument("--grid",    default="auto", choices=["auto", "centered", "anchored", "magic"],
                     help="value grid (auto: anchored for positive near-1 tensors, else centered)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print memory savings without loading full weights")

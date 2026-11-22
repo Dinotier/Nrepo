@@ -8,6 +8,10 @@ Code k ∈ [0..31].  Two value grids (identical to compact_weights.cu):
       Sign is the MSB of k; no sign bits.  Dense around 0 like the weights.
   anchored (original Fiver, positive values clustered near 1, e.g. RMSNorm γ):
       w(k) = 1 − 2^(−k/4) for k < 16,   1 + 2^(−(31−k)/4) for k ≥ 16
+  magic (centered, magnitude from the bit formula 0x3F800000 − (m << 21)):
+      2^(−m/4) with a piecewise-linear mantissa, fixed deviations 0/+4.06/
+      +6.07/+5.11 %; multiples of 1/64, exact in fp16 and in int8 (×64).
+      Decodes without a table (shift + subtract): decode_magic_bits().
 
 Tensor value:  x[r, c] ≈ scale[r] · v(k[r, c])   — one float scale per row
 (row = all leading dimensions, columns = last dimension; 1-D = one row).
@@ -26,8 +30,22 @@ ANCHORED = np.r_[1.0 - _DELTA, (1.0 + _DELTA)[::-1]]       # ascending in k
 CENTERED = ANCHORED - 1.0
 CENTERED[16] = 0.0
 
-GRIDS     = {"centered": CENTERED, "anchored": ANCHORED}
-ZERO_CODE = {"centered": 16, "anchored": 0}
+
+
+def decode_magic_bits(k: np.ndarray) -> np.ndarray:
+    """MAGIC grid by formula, as a table-free backend (CPU SIMD, FPGA) computes it."""
+    k   = np.asarray(k, dtype=np.uint32)
+    dir_ = (k >> 4) & 1
+    m   = (k ^ (0 - dir_)) & 15                      # k for k < 16, 31 − k for k ≥ 16
+    b   = (np.uint32(0x3F800000) - (m << 21)) | ((dir_ ^ 1) << 31)
+    v   = b.astype(np.uint32).view(np.float32).astype(np.float64)
+    return np.where(k == 16, 0.0, v)
+
+
+MAGIC = decode_magic_bits(np.arange(32))
+
+GRIDS     = {"centered": CENTERED, "anchored": ANCHORED, "magic": MAGIC}
+ZERO_CODE = {"centered": 16, "anchored": 0, "magic": 16}
 WEIGHTS_PER_WORD = 6
 
 
@@ -65,7 +83,7 @@ def float_to_fiver(x: np.ndarray, grid: str = "auto", n_scales: int = 48,
         qs = [float_to_fiver(x, g, n_scales, chunk_rows, quiet=True) for g in candidate_grids(x)]
         return min(qs, key=lambda q: quantization_error(x, q)["rel_rmse"])
     if grid not in GRIDS:
-        raise ValueError(f"grid must be 'auto', 'centered' or 'anchored', got {grid!r}")
+        raise ValueError(f"grid must be 'auto' or one of {sorted(GRIDS)}, got {grid!r}")
     V = GRIDS[grid]
     shape = tuple(x.shape)
     X = _as_rows(np.asarray(x, dtype=np.float64))

@@ -216,9 +216,31 @@ uint32: │ r │ r │ k5 │ k4 │ k3 │ k2 │ k1 │ k0 │   k_i an Bit 5
 - Das ursprüngliche Gitter bleibt als `anchored` (`w = 1 ∓ 2^(−m/4)`, Code 0 = 0)
   für positive Tensoren mit Mittel > σ; `--grid auto` probiert dann beide.
   int8: w = 1 + e/127, der Σx-Term ist eine Zahl pro Eingabezeile.
-- GGUF-Typ 0x0105 (centered) / 0x0106 (anchored).
+- GGUF-Typ 0x0105 (centered) / 0x0106 (anchored) / 0x0107 (magic, Abschnitt 7.1).
 
-## 7.1 Offene Optionen
+## 7.1 Drittes Gitter: `magic` (Bit-Formel)
+
+```
+m    = k (k < 16)  bzw.  31 − k (k > 16)
+|v|  = float_bits(0x3F800000 − (m << 21))     Shift + Subtraktion, keine Tabelle
+v    = −|v| für k < 16,  v(16) = 0,  +|v| für k > 16
+```
+
+- Exponent und Mantisse verschieben sich gemeinsam: 2^(−m/4) mit linearer Mantisse
+  (Mitchell/Schraudolph). Feste Abweichung je Viertel-Oktave 0 / +4,06 / +6,07 / +5,11 %;
+  +6,07 % ist √2 ≈ 1,5.
+- Alle Werte sind Vielfache von 1/64: exakt in fp16 und exakt in int8 (e = 64·v,
+  −64 … 64). Der int8-Pfad hat für dieses Gitter keinen Rundungsfehler auf den Gewichten.
+- Kosten zur Laufzeit (sm_61, Maschinencode): Shuffle-Tabelle ~2 Befehle pro Gewicht,
+  Bit-Formel ~12 (davon 2 für den Betrag, der Rest für Spiegelung, Vorzeichen, Null-Code),
+  exaktes 2^(−m/4) per Bit-Trick ~18. Auf der GPU entpackt daher auch `magic` per Tabelle;
+  die Formel ist der Weg für Backends ohne 32er-Registertabelle (FPGA, AVX2) — alle
+  Backends erhalten bitgleiche Gewichte. `--bench-gemv` misst Tabelle gegen Formel.
+- Genauigkeit (SmolLM, Layer 0, 7 Tensoren): 9,4 % statt 8,9 % mittlerer Fehler (~5 %
+  schlechter als `centered`). Training eines Testlayers: gleich (MSE 0,0299 vs 0,0294).
+- GGUF-Typ 0x0107.
+
+## 7.2 Offene Optionen
 
 - 6-Bit-Codes (5 pro uint32, 6,4 bpw): lohnt bei Ausreißer-Tensoren (L0) und Norm-Vektoren.
 - Gitter pro Tensor nach Kurtosis wählen (uniform bei Gauß, Fiver-Log bei Ausreißern):

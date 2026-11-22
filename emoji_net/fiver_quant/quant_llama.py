@@ -177,7 +177,7 @@ if __name__ == "__main__":
                     help="Comma-separated: embed, norm, proj, all  (default: embed,norm,proj)")
     ap.add_argument("--out",     default="./llama_fiver",
                     help="Output directory for quantized .npz files")
-    ap.add_argument("--grid",    default="auto", choices=["auto", "centered", "anchored"],
+    ap.add_argument("--grid",    default="auto", choices=["auto", "centered", "anchored", "magic"],
                     help="value grid (auto: anchored for positive near-1 tensors such as "
                          "RMSNorm, centered otherwise)")
     ap.add_argument("--dry-run", action="store_true",
