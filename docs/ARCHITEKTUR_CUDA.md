@@ -1,0 +1,341 @@
+# Fiver CUDA — Architektur für den Um- und Neubau
+
+*Stand: Branch `claude/compact-weight-format-nKv8j`, `compact_weights.cu` mit drei Gittern
+(centered / anchored / magic). Ziel-Hardware zuerst: GTX 1080 Ti (sm_61), danach Turing+.*
+
+> **Wichtig vorab:** Keine Zahl in diesem Dokument ist auf einer GPU gemessen. Der bisherige
+> Code wurde nur kompiliert (CUDA 12.0) und auf dem Host geprüft. Leistungsangaben sind
+> Roofline-Abschätzungen oder Zielwerte und als solche markiert. Jede Phase im Migrationsplan
+> (Abschnitt 10) endet deshalb mit einem Messlauf auf echter Hardware.
+
+---
+
+## 1. Ausgangslage in einem Absatz
+
+Das Format steht und ist geprüft: 6 Codes à 5 Bit pro `uint32`, eine float-Skala pro Zeile,
+drei Wertegitter hinter einer 32-Einträge-Tabelle. Die Kernels sind fusioniert, die Gewichte
+bleiben also gepackt. Sie sind aber als *Proof of Concept* gebaut: eine Datei mit Format,
+Kernels, Tests, Benchmarks und `main`, ein Warp pro Ausgabezeile, keine Kachelung, keine
+Bibliothek und keine Anbindung an Python. Das EmojiNet-Training läuft deshalb weiter in numpy
+auf der CPU. Der Neubau soll daraus eine Bibliothek machen, die ein Trainingsschritt
+tatsächlich auf der GPU ausführt und dabei nahe an die Hardwaregrenzen kommt.
+
+---
+
+## 2. Hardware-Grenzen (Roofline)
+
+| | GTX 1080 Ti (sm_61) | Anmerkung |
+|---|---|---|
+| DRAM | 484 GB/s, 11 GB | |
+| FP32 | ≈ 11,3 TFLOP/s | 28 SM × 128 Lanes × 1,58 GHz × 2 |
+| INT8 `__dp4a` | ≈ 45 TOP/s | 4 MACs pro Lane und Befehl |
+| FP16-Arithmetik | 1/64 von FP32 | auf Pascal unbrauchbar, nur als Speicherformat |
+| Tensor Cores | keine | ab sm_75 (INT8), sm_89 (FP8) |
+| Shared Memory | 96 KB/SM, 48 KB/Block | |
+| L2 | 2,75 MB | |
+
+**Arithmetische Intensität** einer Fiver-Schicht mit Batch B: pro Gewicht 0,67 Byte gelesen,
+2·B FLOP gerechnet → **3·B FLOP/Byte**.
+
+| Bereich | FP32-Pfad | `__dp4a`-Pfad |
+|---|---|---|
+| speichergebunden bis | B ≈ 8 (Knick 23 FLOP/B) | B ≈ 31 (Knick 93 OP/B) |
+| Konsequenz | GEMV bis Batch ~8 | INT8 lohnt ab Batch ~8, bis ~31 sogar bis zu 4× |
+
+Daraus folgen **zwei Regime**, die getrennte Kernels brauchen:
+- **GEMV** (B = 1…8): Inferenz, LLM-Token für Token. Hier zählt nur die Bandbreite.
+- **GEMM** (B ≥ 16): Training (EmojiNet mit Batch 32), Prefill. Hier zählt die Rechenleistung,
+  und das Entpacken muss sich auf viele Batch-Spalten verteilen.
+
+---
+
+## 3. Bestandsaufnahme
+
+| Baustein | heute | Problem | Folge |
+|---|---|---|---|
+| Struktur | 1 Datei, 1 Executable | keine Bibliothek, keine C-Schnittstelle | Python kann nichts aufrufen → kein GPU-Training |
+| GEMV float | Warp pro Zeile, BT = 4, x per `__ldg` mit 6 Einzel-Loads je Wort | pro Wort 7 Loads + 6 Shuffles über dieselbe Load/Shuffle-Einheit: grob 15 Gewichte/Takt/SM ≈ 650 G/s, also knapp *unter* der DRAM-Grenze (718 G/s) | vermutlich Load-Issue-gebunden statt bandbreitengebunden (Schätzung, mit Nsight prüfen) |
+| GEMV Batch > 4 | Grid-y über Batch-Kacheln | W wird pro 4 Batch-Zeilen neu gelesen und neu entpackt | bei Batch 64: 16× W-Traffic |
+| `__dp4a` | wie GEMV, 2 dp4a/Wort | x-Quantisierung als eigener Kernel bei jedem Aufruf | 2–3 Extra-Launches pro Schicht |
+| Tensor Cores | WMMA, 1 Warp pro 16×16-Kachel, Byte-Stores in Shared Memory | Entpacken (256 Wörter) dominiert gegenüber 6 MMAs, keine Latenzverdeckung, kein Double Buffering | TCs größtenteils ungenutzt |
+| dX (Backward) | Thread pro Wort, atomicAdd über 64er-Zeilenstreifen | nicht deterministisch, viele Atomics | Reproduzierbarkeit fehlt |
+| STE-Update | Warp pro 4 Zeilen, Gradient per skalarer FMA | g = dYᵀX ist eine GEMM (rows×cols×batch), läuft aber ohne Kachelung, jedes X-Element nur 4× genutzt | weit unter FP32-Peak (Schätzung: < 10 %) |
+| Epiloge | Skala im Kernel, sonst nichts | Bias, Aktivierung, Residual extra | zusätzliche Speicherpässe |
+| act_bits | 2 Bit Aktivierung pro Gewicht | bricht die int8-Zerlegung, kostet Loads | Sonderweg in jedem Kernel |
+| Tests | im Executable, Host-Referenz in double | gut, aber nur manuell auf GPU ausführbar | kein CI |
+
+**Was bleibt, weil es sich bewährt hat:**
+- Das Format (Wort-Layout, Zeilen-Padding mit Null-Code, Zeilenskala).
+- Das Entpacken per Register-Shuffle (32 Codes = 32 Lanes).
+- Die int8-Tabellen und die exakte Integer-Prüfung in den Tests.
+
+---
+
+## 4. Zielarchitektur
+
+```
+                ┌──────────────────────────────────────────────────────────┐
+  C# Controller │ benchA/benchB → compact_weights_test (unverändert)       │
+                │ pyTorch_nv   → python train.py --backend cuda (existiert) │
+                └───────────────┬──────────────────────────────────────────┘
+                                │
+                ┌───────────────▼──────────────────────────────────────────┐
+  Python        │ fiver.py  FiverLayer(backend="numpy" | "cuda")            │
+                │ fiver_cuda.py  ctypes-Wrapper, Handles, Device-Puffer     │
+                └───────────────┬──────────────────────────────────────────┘
+                                │  C-ABI (extern "C")
+                ┌───────────────▼──────────────────────────────────────────┐
+  libfiver_cuda │ api.cpp        Handles, Streams, Workspace, Fehlercodes   │
+                │ dispatch.cpp   (Arch, Batch, Shape) → Kernel-Variante     │
+                │ ┌────────────┬──────────────┬─────────────┬────────────┐ │
+                │ │ gemv.cu    │ gemm_*.cu    │ backward.cu │ quant.cu   │ │
+                │ └────────────┴──────────────┴─────────────┴────────────┘ │
+                │ include/fiver/format.h   Format, Gitter, Tabellen, Packen │
+                └──────────────────────────────────────────────────────────┘
+```
+
+**Verzeichnisstruktur:**
+```
+cuda/
+  include/fiver/format.h      header-only, Host + Device + reines C (auch für CPU-Backend)
+  include/fiver/fiver.h       C-ABI
+  src/api.cpp  src/dispatch.cpp
+  src/gemv.cu  src/gemm_sm61.cu  src/gemm_mma.cu  src/quant.cu  src/backward.cu
+  tests/test_main.cu          + gemeinsame CPU-Referenz (tests/reference.c)
+  bench/bench_main.cu
+compact_weights.cu            dünnes CLI: --bench-a / --bench-b / --test / --bench-*
+                              (Flags bleiben, C# muss nichts ändern)
+bench/cpu_fiver_decode.c      CPU-Messung (Abschnitt 8)
+```
+
+`format.h` ist die einzige Quelle für das Format. Die Python-Seite (`fiver_core.py`) wird in
+den Tests gegen dieselben Tabellen geprüft. Das macht `xcheck` heute schon, künftig fest im
+Test-Target.
+
+---
+
+## 5. Kernel-Design
+
+### 5.1 Forward GEMV (Batch 1–8)
+
+- **CTA:** 4 Warps, jeder Warp 2–4 Ausgabezeilen (R). Das wird pro Arch per Benchmark gewählt.
+- **x in Shared Memory:** einmal pro CTA in Spaltenblöcken von z. B. 3072 floats (12 KB), mit
+  `float4`-Loads. Alle R × 4 Zeilen lesen x danach aus Shared Memory statt aus L1. Das senkt
+  die Load-Befehle pro Gewicht von heute 1 auf etwa 1/4 (Lesen per `LDS.128`).
+- **Gewichte:** pro Lane ein `uint4` = 4 Wörter = 24 Gewichte, ein Warp-Request = 512 Byte.
+- **Entpacken:** unverändert per Register-Shuffle. Die Tabelle wird pro Kernel einmal geladen.
+- **Epilog:** Zeilenskala, Bias, Aktivierung (GELU, Softsign, Identität) und optional
+  int8-Quantisierung der Ausgabe für die nächste Schicht (5.3).
+- **Ziel:** ≥ 80 % der DRAM-Bandbreite bei B = 1, also ≥ 570 G Gewichte/s auf der 1080 Ti.
+
+### 5.2 Forward GEMM (Batch ≥ 16)
+
+Gemeinsames Muster für alle Archs: **eine CTA-Kachel W (M×K) wird einmal entpackt und von
+allen N Batch-Spalten der Kachel genutzt.** Das Entpacken verteilt sich auf N statt auf 4.
+
+| Arch | Kachel (M×N×K) | Entpacken nach | Rechenwerk | Laden |
+|---|---|---|---|---|
+| sm_61 FP32 | 128×64×96 | Register (float) | FFMA, 8×8 pro Thread | `ld.global` + Double Buffer in Shared Memory |
+| sm_61 INT8 | 128×64×96 | Shared Memory (int8 e) | `__dp4a`, 8×4 pro Thread | wie oben, x vorquantisiert |
+| sm_75 | 128×64×96 | Shared Memory (int8 e) | `mma.sync m8n8k16.s8` | `ldmatrix` |
+| sm_80/86 | 128×128×96 | Shared Memory (int8 e / fp16) | `mma.sync m16n8k32.s8` | `cp.async`, 3 Stufen |
+| sm_89/90 | wie sm_80 | Shared Memory (FP8) | FP8-MMA | `magic`-Gitter ist in FP8 exakt (nur 2 Mantissenbits) |
+
+- **K = 96:** 16 Wörter pro Zeile, damit fallen Kachelgrenzen auf Wortgrenzen. Das ist auch
+  die Bedingung für das spätere In-place-Update in 5.6.
+- **Entpacken in Shared Memory:** konfliktfrei mit r = idx % 16 (heute schon so). Dazu
+  32-Bit-Stores statt Byte-Stores: 4 int8-Codes zusammenpacken, dann ein Store.
+- **Ziel sm_61:** FP32 ≥ 60 % Peak, `__dp4a` ≥ 50 % Peak bei B = 64…256.
+
+### 5.3 Aktivierungs-Quantisierung (INT8-Pfade)
+
+Heute läuft vor jeder int8-Schicht ein eigener Kernel: Maximum pro Zeile, quantisieren,
+Triplets packen. Neu:
+- Der **Epilog der vorherigen Schicht** schreibt direkt int8 + `sx` + `Σxq`.
+- Das Maximum pro Zeile braucht dafür eine Reduktion über alle CTAs der Zeile: Teilmaxima pro
+  CTA, dann ein kleiner Abschluss-Kernel, oder dynamisch pro Kachel mit Kachelskala statt
+  Zeilenskala. **Entscheidung offen (11.4).**
+- Bei LayerNorm davor (EmojiNet) ist ein fester Bereich nach der Norm eine einfache Alternative.
+
+### 5.4 Epilog-Fusion
+
+Ein Epilog-Template mit Bausteinen, der Reihe nach: Skala → Bias → Aktivierung → Residual →
+Ausgabeformat (fp32 / int8 + Skala). Spart pro Schicht 1–3 Speicherpässe über die Ausgabe.
+
+### 5.5 Backward dX = Wᵀ · (s ∘ dY)
+
+- **Dieselbe Kachel-Maschinerie wie 5.2,** nur in transponierter Rolle: Ausgabe über Spalten c,
+  Reduktion über Zeilen r. Die W-Kachel (r-Block × c-Block) wird genauso entpackt.
+- **Keine Atomics:** Die Reduktion über r läuft innerhalb der CTA. Bei sehr vielen Zeilen kommt
+  Split-K mit fester Reihenfolge dazu (Teilsummen in einen Puffer, zweiter Kernel summiert
+  deterministisch).
+
+### 5.6 Backward Gewichts-Gradient + STE (fusioniert)
+
+g = dYᵀ · X ist eine GEMM mit **K = Batch** (16…256). Sie wird gekachelt wie 5.2:
+- **CTA-Kachel:** 64 Zeilen × 96 Spalten (16 Wörter), K-Schleife über den Batch.
+- **Akkumulation:** in Registern bzw. MMA-Fragmenten. Auf Turing+ reicht fp16/bf16-MMA, weil nur
+  das **Vorzeichen** von g gebraucht wird. Fehlerhaft ist es nur dort, wo |g| ≈ 0 ist, und dort
+  ist das Vorzeichen sowieso zufällig.
+- **Epilog:** die 16 gepackten Wörter jeder Zeile der Kachel lesen, k ∓ 1 sättigend anwenden
+  (Padding-Spalten nicht anfassen), zurückschreiben. **Die Gradient-Matrix existiert nie im
+  Speicher,** wie heute, nur jetzt mit Kachel-Wiederverwendung von X und dY.
+- **Bias-Gradient:** Σ_b dY im selben Kernel (Zeilenblock pro CTA, kein Atomic, weil die
+  Zeilen-CTAs disjunkt sind; Split über Spalten muss die Bias-Summe einem Block zuordnen).
+- **Ziel:** ≥ 40 % FP32-Peak auf sm_61; Backward-Schritt ≤ 3× Forward-Zeit.
+
+### 5.7 Determinismus
+
+Alle Standardpfade sind deterministisch, ohne Atomics auf float. Optionale schnellere Pfade
+mit Atomics bekommen ein Flag.
+
+---
+
+## 6. Host-Seite
+
+- **Handles:** `fiver_matrix_t` (Device-Wörter, Zeilenskalen, Gitter, Form) und
+  `fiver_ctx_t` (Stream, Workspace-Pool, Arch-Info, Dispatch-Tabelle).
+- **Workspace:** einmal pro Kontext, wächst bei Bedarf. Kein `cudaMalloc` im Hot Path.
+- **Fehler:** alle API-Funktionen geben `fiver_status_t` zurück, kein `exit()` in der
+  Bibliothek. `CW_CUDA_CHECK` mit `exit` bleibt nur im CLI und in den Tests.
+- **CUDA Graphs:** Ein Trainingsschritt (Forward aller Schichten, Backward, Update) wird nach
+  dem ersten Lauf als Graph aufgezeichnet. EmojiNet hat 4 Fiver-Schichten, also ≈ 12 Fiver-Kernels
+  pro Schritt plus Norm und Loss. Bei kurzen Kernels ist die Launch-Latenz (einige µs je Launch)
+  ein merklicher Anteil, den Graphs größtenteils einsparen.
+- **Dispatch:** Tabelle (Arch, Batch-Bereich, Gitter) → Kernel-Variante. Erster Wurf per
+  Heuristik, später per Autotuning beim ersten Aufruf mit Cache-Datei.
+
+**C-ABI (Entwurf):**
+```c
+fiver_status_t fiver_ctx_create(fiver_ctx_t** ctx, int device);
+fiver_status_t fiver_matrix_upload(fiver_ctx_t*, const uint32_t* words, const float* row_scale,
+                                   uint32_t rows, uint32_t cols, int grid, fiver_matrix_t** out);
+fiver_status_t fiver_matrix_download(fiver_ctx_t*, const fiver_matrix_t*, uint32_t* words);
+fiver_status_t fiver_forward(fiver_ctx_t*, const fiver_matrix_t*, const float* x, float* y,
+                             uint32_t batch, const fiver_epilogue_t* epi);
+fiver_status_t fiver_backward_step(fiver_ctx_t*, fiver_matrix_t*, const float* x, const float* dy,
+                                   float* dx /*nullable*/, float* bias /*nullable*/,
+                                   uint32_t batch, float lr);
+```
+
+---
+
+## 7. Anbindung an Python und C#
+
+- **Python:** `fiver_cuda.py` lädt `libfiver_cuda.so` per `ctypes`. Ohne Build-Abhängigkeit
+  und ohne PyTorch. `FiverLayer(backend="cuda")` hält die Matrix dauerhaft auf der GPU.
+  - **Phase 1:** Nur die Fiver-Schichten laufen auf der GPU. Aktivierungen werden pro Schicht
+    kopiert, bei EmojiNet sind das Batch × 512 floats, also klein. LayerNorm, Loss und Attention
+    bleiben vorerst in numpy.
+  - **Später:** Aktivierungen bleiben auf dem Gerät, dafür kommen Device-Puffer-Handles in die
+    Python-API.
+- **C#:** `pyTorch_nv` ruft heute schon `train.py --backend cuda` auf (`pyTorch_i86` →
+  `cpu`, `pyTorch_risc` → `mps`). `train.py` loggt den Wert bisher nur. In P1 wählt
+  `--backend cuda` die neue Bibliothek, `benchA/benchB` bleiben beim CLI-Binary mit denselben
+  Flags. **Der Controller muss nicht geändert werden.**
+- **Alternative:** eine PyTorch-Extension (`torch.autograd.Function`). Die Namen
+  `pyTorch_nv/i86/risc` legen das nahe, der Python-Code nutzt PyTorch aber bisher nicht.
+  **Entscheidung offen (11.1).**
+
+---
+
+## 8. Die drei Backends und das Entpacken
+
+### 8.1 Gemessen: CPU (`bench/cpu_fiver_decode.c`)
+
+Emerald-Rapids-Xeon (Cloud-VM, 1 Kern, Takt unbekannt, Läufe schwanken um ±20 %), GEMV-Zeile
+4608 Spalten, `magic`-Gitter, ganze SIMD-Blöcke:
+
+| Variante | Befehle pro Block | llvm-mca Takte/Gewicht (Skylake … Zen 4) | gemessen ns/Gewicht (0,8 MB / 25 MB) |
+|---|---|---|---|
+| AVX2 LUT (4× `vpermps` + Blends) | 40 / 24 Gew. | 0,75 – 0,88 | 0,31 / 0,35 |
+| AVX2 LUT per Gather | 25 / 24 Gew. | Intel 1,13 – 1,55 (Zen 0,2, vermutlich unrealistisch) | 0,23 / 0,28 |
+| **AVX2 magic per Formel** | 46 / 24 Gew. | **0,59 – 0,69** | **0,24 / 0,25** |
+| **AVX-512 LUT (1× `vpermt2ps`)** | **13 / 48 Gew.** | **0,13 – 0,20** | **0,05 / 0,05** |
+| AVX-512 LUT per Gather | 22 / 48 Gew. | 0,56 – 0,65 (Zen 0,19) | 0,20 / 0,22 |
+| AVX-512 magic per Formel | 43 / 48 Gew. | 0,44 – 0,45 | 0,16 / 0,17 |
+
+- **AVX2:** Die Formel braucht *mehr* Befehle als die Tabelle, ist aber schneller. Die
+  32er-Tabelle braucht 15 Shuffles pro Block, und die laufen auf Intel alle über Port 5. Die
+  Formel verteilt sich auf die normalen ALUs. **→ AVX2-Backend entpackt `magic` per Formel.**
+- **AVX-512:** `vpermt2ps` liest genau die Bits 4:0, also den 5-Bit-Code, und schlägt alle 32
+  Einträge in einem Befehl nach. Das ist 3× schneller als die Formel. **→ AVX-512 per Tabelle.**
+- **Gather:** ein Befehl, aber stark CPU- und Microcode-abhängig. Auf Skylake bis Ice Lake hat
+  Intel Gathers per Downfall-Mitigation deutlich verlangsamt. **→ nicht als Standard.**
+- **CPU-spezifisch:** Auf der CPU ist das Entpacken *der* Engpass. AVX2 liest nur 2–3 GB/s
+  gepackt, weit unter der Speicherbandbreite. Deshalb zählt der Entpack-Weg dort, anders als bei
+  GPU-GEMV.
+
+### 8.2 Empfehlung je Backend
+
+| Backend | Entpacken | int8-Pfad | Bemerkung |
+|---|---|---|---|
+| `nv` (CUDA) | Register-Shuffle-LUT, für alle Gitter | `__dp4a` / IMMA, `magic` exakt mit Skala 64 | Formel-Variante nur als Benchmark (`--bench-gemv`) |
+| `i86` AVX-512 | `vpermt2ps` | VNNI `vpdpbusd`, AMX bei großem Batch | |
+| `i86` AVX2 | `magic`-Formel | `vpshufb` (2× 16 Byte) + `vpmaddubsw` | `magic` als Standardgitter für AVX2-Rechner |
+| `risc` ARM NEON | Formel (float) | `vqtbl2q_s8`: 32-Byte-Tabelle = genau 32 Codes, dann `sdot` | nicht gemessen |
+| `risc` FPGA | Formel als Shifter + Subtrahierer | Gewicht · x als Exponenten-Addition (nur `magic`) | kein Tabellenspeicher, kein Multiplizierer nötig |
+
+Weil alle Backends dasselbe `magic`-Gitter bitgleich erzeugen, kann ein auf der GPU trainiertes
+Modell ohne Umrechnung auf CPU oder FPGA laufen.
+
+---
+
+## 9. Test- und Messstrategie
+
+- **Referenz:** eine gemeinsame CPU-Referenz in C (Format, GEMV, GEMM, Backward, STE) für die
+  CUDA-Tests und den Python-Abgleich. Die heutigen Host-Referenzen wandern dorthin.
+- **Korrektheit:**
+  - Integer-Pfade bitgenau.
+  - Float-Pfade ≤ 1e-5 relativ zu Σ|w·x|.
+  - STE-Update exakt bis auf die heute schon gezählten „ambiguous“-Fälle mit |g| ≈ 0.
+- **Formen:** ungerade Spaltenzahlen (Padding), Batch-Reste, Zeilen < Kachel, cols > 65536
+  (INT8-Grenze), leere Zeilen (Skala 0).
+- **Werkzeuge:** `compute-sanitizer --tool memcheck|racecheck` in jeder Phase, Nsight Compute
+  für die Roofline-Kennzahlen (`dram__throughput`, `sm__inst_executed_pipe_*`).
+- **CI:** Build-Job ohne GPU (Kompilieren für alle Archs, Python-Tests, `xcheck`). GPU-Tests
+  laufen auf deiner 1080 Ti oder auf einem Self-Hosted-Runner. Aus dieser Cloud-Umgebung heraus
+  kann ich keine GPU nutzen.
+- **Benchmarks:** jeweils gegen die Roofline aus Abschnitt 2 berichten: Anteil an Bandbreite
+  bzw. Peak, nicht nur ms.
+
+---
+
+## 10. Migrationsplan
+
+| Phase | Inhalt | Ergebnis / Abnahme |
+|---|---|---|
+| **P0** Struktur | `format.h`, Bibliothek + CLI, Tests und Benchmarks auslagern. Keine Verhaltensänderung | `--test` grün, Benchmark-Zahlen ±5 % gleich, CLI-Flags unverändert |
+| **P1** Anbindung | C-ABI, `fiver_cuda.py`, `FiverLayer(backend="cuda")` mit den heutigen Kernels; `train.py --backend cuda` (von C# schon übergeben) nutzt sie | erstes EmojiNet-Training auf der GPU. Loss-Verlauf wie numpy (gleiche Seeds, Toleranz). Basiszeit pro Schritt gemessen |
+| **P2** GEMV v2 | 5.1: x in Shared Memory, `uint4`-Loads, R Zeilen pro Warp, Epilog | ≥ 80 % DRAM-Bandbreite bei B = 1 |
+| **P3** GEMM sm_61 | 5.2: FP32-SIMT- und `__dp4a`-Kachelkernel, Dispatch nach Batch | FP32 ≥ 60 %, dp4a ≥ 50 % Peak bei B = 64 |
+| **P4** Backward v2 | 5.5 und 5.6: gekacheltes dX ohne Atomics, fusioniertes dYᵀX + STE | Backward ≤ 3× Forward, deterministisch |
+| **P5** Fusion | 5.3/5.4: Epiloge, int8-Ausgabe, CUDA Graph pro Schritt | Kernels pro Schritt halbiert, Schrittzeit gemessen |
+| **P6** Turing+ | `mma.sync`-Varianten sm_75/80, `cp.async` | auf Turing+ gemessen (braucht entsprechende Karte) |
+| **P7** optional | FP8 für `magic` (sm_89/90), 6-Bit-Codes, CPU-Backend aus Abschnitt 8 | jeweils eigene Messung |
+
+P0 und P1 bringen keine Beschleunigung, sind aber die Voraussetzung dafür, dass jede weitere
+Phase am echten Trainingsschritt gemessen werden kann. Sinnvolle Reihenfolge danach: P3 vor P2,
+denn EmojiNet trainiert mit Batch 32 im GEMM-Regime, GEMV ist eher für LLM-Inferenz.
+
+---
+
+## 11. Offene Entscheidungen und Risiken
+
+1. **Python-Anbindung:** `ctypes` (schlank, ohne Abhängigkeit) oder PyTorch-Extension (passt
+   zu den Namen `pyTorch_*`, bringt Autograd mit, aber eine große Abhängigkeit).
+   *Vorschlag:* ctypes für P1, PyTorch nur, wenn das Training ohnehin auf PyTorch umziehen soll.
+2. **act_bits (Aktivierung pro Gewicht):** kostet in jedem Kernel einen Sonderweg und bricht die
+   int8-Pfade. *Vorschlag:* in der neuen Bibliothek nur im float-GEMV unterstützen oder ganz
+   streichen. Bisher nutzt es kein Modell.
+3. **Gitter für EmojiNet:** `centered` ist ~5 % genauer, `magic` ist backend-übergreifend
+   bitgleich und in int8 und FP8 exakt. *Vorschlag:* `magic`, wenn i86/risc wirklich kommen.
+4. **int8-Aktivierungen im Training:** Ob das STE-Training mit quantisiertem x stabil bleibt,
+   ist ungeprüft. *Vorschlag:* in P3 beide Pfade (float, dp4a) am Loss-Verlauf vergleichen.
+5. **Zeilenskala vs. Blockskala:** Blockskalen (32–96 Gewichte) wären genauer (nicht gemessen)
+   und passen zur Kachelung mit K = 96. Sie ändern aber das Format. *Vorschlag:* nach P3 messen.
+6. **Treiber/Toolkit:** Die 1080 Ti braucht CUDA 12.x (CUDA 13 hat sm_61 entfernt). Laut
+   NVIDIA ist die Treiberreihe R580 die letzte mit Pascal-Unterstützung. Turing+-Pfade
+   langfristig separat pflegen.
+7. **Kein GPU-Zugang in der Entwicklungsumgebung:** Jede Phase braucht einen Messlauf auf
+   echter Hardware, bevor die nächste beginnt. Das ist der größte Zeitfaktor.

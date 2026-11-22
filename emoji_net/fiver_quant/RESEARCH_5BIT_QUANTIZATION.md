@@ -238,6 +238,9 @@ v    = −|v| für k < 16,  v(16) = 0,  +|v| für k > 16
   Backends erhalten bitgleiche Gewichte. `--bench-gemv` misst Tabelle gegen Formel.
 - Genauigkeit (SmolLM, Layer 0, 7 Tensoren): 9,4 % statt 8,9 % mittlerer Fehler (~5 %
   schlechter als `centered`). Training eines Testlayers: gleich (MSE 0,0299 vs 0,0294).
+- CPU (gemessen, `bench/cpu_fiver_decode.c`): auf AVX2 ist die Formel schneller als die
+  32er-Tabelle (Shuffle-Port-Engpass), auf AVX-512 ist die Tabelle per `vpermt2ps` 3× schneller.
+  Werte sind auch in FP8 (E4M3/E5M2) exakt. Details: `docs/ARCHITEKTUR_CUDA.md`, Abschnitt 8.
 - GGUF-Typ 0x0107.
 
 ## 7.2 Offene Optionen
