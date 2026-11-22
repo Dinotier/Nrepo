@@ -1,7 +1,7 @@
 """
 fiver.py — Fiver 5-bit weight encoding for training (EmojiNet).
 
-Code k ∈ [0..31], two value grids (identical to compact_weights.cu):
+Code k ∈ [0..31], three value grids (identical to cuda/include/fiver/format.h):
 
   centered (default):  v(k) = −2^(−k/4) for k < 16,  v(16) = 0,  +2^(−(31−k)/4) for k > 16
                        signed weights, sign = MSB of k, no sign bits
@@ -10,12 +10,18 @@ Code k ∈ [0..31], two value grids (identical to compact_weights.cu):
   magic:               like centered, magnitude = float_bits(0x3F800000 − (m << 21))
                        (shift + subtract, no table; exact in fp16 and int8)
 
-Both grids are strictly increasing in k.  Effective weight W = scale · v(k)
+All grids are strictly increasing in k.  Effective weight W = scale · v(k)
 with a fixed per-layer scale (centered/magic: 2/√in_dim, anchored: 1).
 
 STE update rule: k −= sign(lr · ∂L/∂W), saturating at [0, 31].
 One integer increment/decrement per weight per step; on the centered grid a
 weight changes sign by walking through code 16.
+
+Backends: "numpy" (default) or "cuda" (libfiver_cuda via fiver_cuda.py).  The
+CUDA backend keeps the codes on the device; backward() returns grad_x with
+the current weights and keeps (x, grad) until step(), which applies the fused
+STE update on the device.  Several backward() calls before one step() are
+concatenated along the batch, which equals the numpy gradient sum.
 """
 import numpy as np
 
@@ -27,6 +33,20 @@ _m = np.arange(16, dtype=np.uint32)
 _MAG = (np.uint32(0x3F800000) - (_m << 21)).view(np.float32)
 MAGIC = np.r_[-_MAG, 0.0, _MAG[:15][::-1]].astype(np.float32)
 GRIDS = {"centered": CENTERED, "anchored": ANCHORED, "magic": MAGIC}
+
+_default_backend = "numpy"
+_default_path = "float"
+
+
+def set_default_backend(backend: str, path: str = "float") -> None:
+    """Backend for FiverLayers created afterwards ('numpy' or 'cuda'); path = 'float' | 'int8'."""
+    global _default_backend, _default_path
+    if backend not in ("numpy", "cuda"):
+        raise ValueError(f"backend must be 'numpy' or 'cuda', got {backend!r}")
+    if backend == "cuda":
+        import fiver_cuda
+        fiver_cuda.default_context()          # raises if the library or device is unavailable
+    _default_backend, _default_path = backend, path
 
 
 def fiver_to_float(k: np.ndarray, grid: str = "centered") -> np.ndarray:
@@ -43,7 +63,7 @@ class FiverLayer:
     """
 
     def __init__(self, in_dim: int, out_dim: int, act: str = 'identity',
-                 grid: str = 'centered', seed: int = 0):
+                 grid: str = 'centered', seed: int = 0, backend: str = None, path: str = None):
         if grid not in GRIDS:
             raise ValueError(f"grid must be one of {sorted(GRIDS)}, got {grid!r}")
         self.in_dim  = in_dim
@@ -51,14 +71,35 @@ class FiverLayer:
         self.act     = act
         self.grid    = grid
         self.scale   = np.float32(1.0 if grid == 'anchored' else 2.0 / np.sqrt(in_dim))
+        self.backend = backend or _default_backend
+        self.path    = path or _default_path
 
         rng = np.random.default_rng(seed)
         # Codes 12..20: centered → small weights around 0, anchored → around 1.0
-        self.k_data = rng.integers(12, 21, size=(out_dim, in_dim), dtype=np.uint8)
-        self.bias   = np.zeros(out_dim, dtype=np.float32)
-
-        self._grad_k    = np.zeros((out_dim, in_dim), dtype=np.float32)
+        k = rng.integers(12, 21, size=(out_dim, in_dim), dtype=np.uint8)
+        self.bias = np.zeros(out_dim, dtype=np.float32)
         self._grad_bias = np.zeros(out_dim, dtype=np.float32)
+
+        if self.backend == "cuda":
+            import fiver_cuda
+            self._ctx = fiver_cuda.default_context()
+            self._dev = self._ctx.matrix(k, np.full(out_dim, self.scale, np.float32), grid)
+            self._pending = []
+        else:
+            self._k = k
+            self._grad_k = np.zeros((out_dim, in_dim), dtype=np.float32)
+
+    @property
+    def k_data(self) -> np.ndarray:
+        return self._dev.codes() if self.backend == "cuda" else self._k
+
+    @k_data.setter
+    def k_data(self, k: np.ndarray) -> None:
+        k = np.asarray(k, dtype=np.uint8)
+        if self.backend == "cuda":
+            self._dev = self._ctx.matrix(k, np.full(self.out_dim, self.scale, np.float32), self.grid)
+        else:
+            self._k = k
 
     # ── Forward ──────────────────────────────────────────────────────────
 
@@ -66,41 +107,57 @@ class FiverLayer:
         """Return float32 weight matrix (out_dim × in_dim)."""
         return self.scale * fiver_to_float(self.k_data, self.grid)
 
+    def _pre_act(self, x: np.ndarray) -> np.ndarray:
+        if self.backend == "cuda":
+            x2 = x.reshape(-1, self.in_dim)
+            y = self._ctx.forward(self._dev, x2, bias=self.bias, path=self.path)
+            return y.reshape(*x.shape[:-1], self.out_dim)
+        return x @ self.materialize().T + self.bias
+
     def forward(self, x: np.ndarray) -> np.ndarray:
         """x: (..., in_dim) → (..., out_dim)"""
-        out = x @ self.materialize().T + self.bias
-        return _apply_act(out, self.act)
+        return _apply_act(self._pre_act(x), self.act)
 
     # ── Backward ─────────────────────────────────────────────────────────
 
     def backward(self, x: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
         """Accumulate gradients via STE. Returns grad_x."""
-        W       = self.materialize()
-        pre_act = x @ W.T + self.bias
-        g       = _act_grad(grad_out, self.act, pre_act)
-
+        g = _act_grad(grad_out, self.act, self._pre_act(x))
         x_flat = x.reshape(-1, self.in_dim)
         g_flat = g.reshape(-1, self.out_dim)
-
-        self._grad_k    += g_flat.T @ x_flat         # ∂L/∂W up to the positive scale
         self._grad_bias += g_flat.sum(axis=0)
 
+        if self.backend == "cuda":
+            self._pending.append((np.ascontiguousarray(x_flat, np.float32),
+                                  np.ascontiguousarray(g_flat, np.float32)))
+            gx = self._ctx.dgrad(self._dev, g_flat)
+            return gx.reshape(*g.shape[:-1], self.in_dim)
+
+        W = self.materialize()
+        self._grad_k += g_flat.T @ x_flat             # ∂L/∂W up to the positive scale
         return g @ W                                  # grad_x: (..., in_dim)
 
     # ── Parameter update ─────────────────────────────────────────────────
 
     def step(self, lr: float):
         """STE discrete update: k −= sign(lr · grad), saturating [0, 31].
-        Same rule as cw_fiver_ste_update in compact_weights.cu."""
-        delta_k = np.sign(self._grad_k * lr).astype(np.int16)
-        self.k_data = np.clip(self.k_data.astype(np.int16) - delta_k, 0, 31).astype(np.uint8)
+        Same rule as wgrad_ste in cuda/src/backward.cu."""
+        if self.backend == "cuda":
+            if self._pending:
+                xs = np.concatenate([p[0] for p in self._pending])
+                gs = np.concatenate([p[1] for p in self._pending])
+                self._ctx.ste_update(self._dev, xs, gs, lr)
+                self._pending = []
+        else:
+            delta_k = np.sign(self._grad_k * lr).astype(np.int16)
+            self._k = np.clip(self._k.astype(np.int16) - delta_k, 0, 31).astype(np.uint8)
+            self._grad_k[:] = 0.0
         self.bias -= lr * self._grad_bias
-        self._grad_k[:]    = 0.0
         self._grad_bias[:] = 0.0
 
     @property
     def num_params(self) -> int:
-        return int(self.k_data.size + self.bias.size)
+        return int(self.in_dim * self.out_dim + self.bias.size)
 
 
 # ── Activation functions ──────────────────────────────────────────────────

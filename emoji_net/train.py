@@ -9,9 +9,9 @@ Called via NetworkController.cs:
   pyTorch_i86(params)  → python train.py --backend cpu    (CPU / default numpy)
   pyTorch_risc(params) → python train.py --backend mps    (ARM / FPGA)
 
-The --backend flag is forwarded from C# and logged; the actual numpy computation
-is backend-agnostic (CPU only for this implementation). Backend selection is the
-hook point for future PyTorch / CUDA acceleration.
+--backend cuda runs the Fiver layers through libfiver_cuda (fiver_cuda.py) and
+falls back to numpy with a warning if the library or GPU is unavailable; cpu and
+mps run numpy.
 """
 import argparse
 import signal
@@ -70,6 +70,17 @@ def train(args: argparse.Namespace) -> None:
           f"  |  {max_elem} elements/category", flush=True)
 
     # ── Model ─────────────────────────────────────────────────────────────
+    if args.backend == "cuda":
+        import fiver
+        try:
+            fiver.set_default_backend("cuda")
+            import fiver_cuda
+            ctx = fiver_cuda.default_context()
+            print(f"[train] Fiver layers on {ctx.device_name} (sm_{ctx.sm}"
+                  f"{', CPU emulator' if ctx.emulator else ''})", flush=True)
+        except Exception as exc:
+            print(f"[train] WARNING: cuda backend unavailable ({exc}) — using numpy",
+                  file=sys.stderr, flush=True)
     model    = EmojiNet(n_cat=n_cat, max_elem=max_elem)
     ckpt_dir = Path(args.data_dir) / "checkpoints"
     print(f"[train] parameters: {model.num_params:,}", flush=True)
@@ -150,7 +161,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train EmojiNet")
     parser.add_argument("--backend",    default="cpu",
                         choices=["cpu", "cuda", "mps"],
-                        help="compute backend (cpu=numpy, cuda/mps=future)")
+                        help="compute backend (cpu=numpy, cuda=libfiver_cuda, mps=numpy for now)")
     parser.add_argument("--epochs",     type=int,   default=10)
     parser.add_argument("--lr",         type=float, default=0.01)
     parser.add_argument("--batch-size", type=int,   default=32)

@@ -99,6 +99,8 @@ Daraus folgen **zwei Regime**, die getrennte Kernels brauchen:
 cuda/
   include/fiver/format.h      header-only, Host + Device + reines C (auch für CPU-Backend)
   include/fiver/fiver.h       C-ABI
+  include/fiver/compat.h      wählt cuda_runtime.h oder den CPU-Emulator
+  include/fiver/cuda_emu.h    CPU-Emulator für Tests ohne GPU (Abschnitt 9)
   src/api.cpp  src/dispatch.cpp
   src/gemv.cu  src/gemm_sm61.cu  src/gemm_mma.cu  src/quant.cu  src/backward.cu
   tests/test_main.cu          + gemeinsame CPU-Referenz (tests/reference.c)
@@ -295,6 +297,14 @@ Modell ohne Umrechnung auf CPU oder FPGA laufen.
   `anchored`, `magic`) ist ein eigener Testfall (Entscheidung 11.3).
 - **Werkzeuge:** `compute-sanitizer --tool memcheck|racecheck` in jeder Phase, Nsight Compute
   für die Roofline-Kennzahlen (`dram__throughput`, `sm__inst_executed_pipe_*`).
+- **CPU-Emulator (`cuda/include/fiver/cuda_emu.h`):** Dieselben Kernel-Quellen laufen mit
+  `-DFIVER_EMU` auf der CPU. Jeder CUDA-Thread ist ein echter Thread, `__syncthreads` und
+  `__syncwarp` sind Barrieren, aus denen beendete Threads ausscheiden. Warp-Shuffles laufen über
+  einen Austauschpuffer pro Warp. Ein nicht konvergenter Shuffle oder eine nicht erreichte
+  Barriere führt dort zum Hängen statt zu falschen Ergebnissen, der Fehler wird also sichtbar.
+  Abgedeckt sind alle sm_61-Pfade (float, `__dp4a`, Kacheln, Backward). WMMA/MMA-Pfade (sm_75+)
+  laufen nur auf echter Hardware. Der Emulator ersetzt keine GPU-Messung, aber er findet
+  Index-, Padding- und Synchronisationsfehler, bevor die Kernels auf die Karte kommen.
 - **CI:** Build-Job ohne GPU (Kompilieren für alle Archs, Python-Tests, `xcheck`). GPU-Tests
   laufen auf deiner 1080 Ti oder auf einem Self-Hosted-Runner. Aus dieser Cloud-Umgebung heraus
   kann ich keine GPU nutzen.
@@ -329,7 +339,7 @@ denn EmojiNet trainiert mit Batch 32 im GEMM-Regime, GEMV ist eher für LLM-Infe
 | 11.1 | Python-Anbindung | **ctypes** gegen die C-ABI aus Abschnitt 6. Keine PyTorch-Abhängigkeit. |
 | 11.2 | act_bits (Aktivierung pro Gewicht) | Nur im **float-GEMV**. Alle anderen Pfade (int8, GEMM, Backward) lehnen Matrizen mit act_bits ab. Hinweis: Wer mit act_bits *trainieren* will, braucht dazu auch ein float-dX, sonst passt der Gradient nicht zum Forward. Das kommt erst, wenn ein Modell es nutzt. |
 | 11.3 | Gitter | **Alle drei Gitter (`centered`, `anchored`, `magic`) werden in jedem Pfad getrennt aufgebaut und getestet.** Keine Variante wird zugunsten einer anderen eingespart. Die Testmatrix ist Pfad × Gitter (Abschnitt 9). Welches Gitter EmojiNet standardmäßig nutzt, ist damit eine reine Konfigurationsfrage. |
-| 11.4 | dX ohne Atomics *(Vorschlag, noch zu bestätigen)* | Gekachelter dX mit Reduktion in fester Reihenfolge (5.5) ist der Standard. Grund: Mit Atomics landen bei 4096 Zeilen und 64er-Streifen 64 Atomics auf jedem dX-Element, bei Batch 32 × 4096 Spalten ≈ 8,4 Mio. Diese werden im L2 serialisiert, wo sie dieselbe Adresse treffen. Geschätzt kostet das so viel wie die Rechnung selbst oder mehr, dazu kommt das Nullsetzen. Außerdem kippen nicht reproduzierbare Rundungen beim STE-Training Vorzeichen nahe 0, und Läufe mit gleichem Seed laufen auseinander. Der Atomics-Pfad bleibt nur als Messvergleich. |
+| 11.4 | dX ohne Atomics | **Entschieden.** Gekachelter dX mit Reduktion in fester Reihenfolge (5.5) ist der Standard. Grund: Mit Atomics landen bei 4096 Zeilen und 64er-Streifen 64 Atomics auf jedem dX-Element, bei Batch 32 × 4096 Spalten ≈ 8,4 Mio. Diese werden im L2 serialisiert, wo sie dieselbe Adresse treffen. Geschätzt kostet das so viel wie die Rechnung selbst oder mehr, dazu kommt das Nullsetzen. Außerdem kippen nicht reproduzierbare Rundungen beim STE-Training Vorzeichen nahe 0, und Läufe mit gleichem Seed laufen auseinander. Der Atomics-Pfad bleibt nur als Messvergleich. |
 
 ## 12. Offen und Risiken
 
@@ -338,9 +348,15 @@ denn EmojiNet trainiert mit Batch 32 im GEMM-Regime, GEMV ist eher für LLM-Infe
    Inferenz ist das gut belegt. Ungeprüft ist, ob STE-Training von Grund auf damit genauso
    konvergiert, denn die Schritte hängen am Vorzeichen des Gradienten, und der hängt an den
    gerundeten Vorwärtswerten. Beim `magic`-Gitter sind die Gewichte in int8 exakt, dort rundet
-   nur x. *Test in P3:* EmojiNet mit gleichen Seeds einmal über den float-Pfad, einmal über
-   `__dp4a` trainieren und die Loss-Kurven vergleichen. Liegen sie dicht beieinander, darf das
-   Training den int8-Pfad nutzen. Sonst nutzt das Training float, und int8 bleibt für die Inferenz.
+   nur x.
+   *Test (vergrößert):* Die int8-Vorwärtsrechnung lässt sich in numpy exakt nachbilden, gleiche
+   Rundung wie `cw_quantize_x` und `cw_grid_e`. Der Vergleich braucht deshalb keine GPU und läuft
+   vor P3. Er nutzt viele Batches und mehrere Seeds, damit Unterschiede zwischen einzelnen Batches
+   herausgemittelt werden: Lehrer-Schüler-Aufgabe, je Seed float- und int8-Pfad mit identischen
+   Daten und Initialisierung, berichtet als Mittelwert ± Streuung der Loss-Kurven und als gepaarte
+   Differenz. Skript: `emoji_net/experiments/int8_training_compare.py`. Liegen die Kurven
+   innerhalb der Seed-Streuung, darf das Training den int8-Pfad nutzen. Sonst nutzt das Training
+   float, und int8 bleibt für die Inferenz. Auf der GPU wird das in P3 mit echten Kernels bestätigt.
 2. **Zeilenskala vs. Blockskala:** bewusst offen. Blockskalen (32–96 Gewichte) wären vermutlich
    genauer (nicht gemessen) und passen zur Kachelung mit K = 96, ändern aber das Format. Die
    neue Bibliothek kapselt die Skala hinter dem Matrix-Handle, damit die Entscheidung später
