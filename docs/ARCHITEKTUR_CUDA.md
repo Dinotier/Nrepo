@@ -357,6 +357,17 @@ denn EmojiNet trainiert mit Batch 32 im GEMM-Regime, GEMV ist eher für LLM-Infe
    Differenz. Skript: `emoji_net/experiments/int8_training_compare.py`. Liegen die Kurven
    innerhalb der Seed-Streuung, darf das Training den int8-Pfad nutzen. Sonst nutzt das Training
    float, und int8 bleibt für die Inferenz. Auf der GPU wird das in P3 mit echten Kernels bestätigt.
+   **Ergebnis (512 → 256 → 64, Batch 32, 2000 Schritte, 6 Seeds, 4096 zurückgehaltene Beispiele):**
+
+   | Gitter | float MSE | int8 MSE | gepaarte Differenz | Streuung zwischen Seeds |
+   |---|---|---|---|---|
+   | centered | 0,10878 ± 0,00098 | 0,10894 ± 0,00134 | +0,15 % ± 0,45 % (s.e.) | 0,90 % |
+   | magic | 0,10978 ± 0,00133 | 0,11002 ± 0,00112 | +0,22 % ± 0,50 % (s.e.) | 1,21 % |
+
+   Kein messbarer Unterschied: Die Differenz liegt weit innerhalb der Seed-Streuung und
+   innerhalb ihres Standardfehlers. **Das Training darf den int8-Pfad nutzen** (nur mit
+   `centered`/`magic`, siehe 13.3). Einschränkung: Der Vergleich deckt das Plateau ab, auf dem
+   das Sign-STE-Training nach ~250 Schritten steht (12.6).
 2. **Zeilenskala vs. Blockskala:** bewusst offen. Blockskalen (32–96 Gewichte) wären vermutlich
    genauer (nicht gemessen) und passen zur Kachelung mit K = 96, ändern aber das Format. Die
    neue Bibliothek kapselt die Skala hinter dem Matrix-Handle, damit die Entscheidung später
@@ -370,6 +381,15 @@ denn EmojiNet trainiert mit Batch 32 im GEMM-Regime, GEMV ist eher für LLM-Infe
    erreicht. Die Leistung (Kachelgrößen, Pipelining, Bank-Konflikte) braucht mehrere
    Mess-Iterationen auf der Zielkarte. Die heutigen Kernels bleiben als Referenz und für kleine
    Batches erhalten, der Umbau ist dadurch inkrementell.
+
+6. **Plateau des Sign-STE-Trainings:** Im int8-Vergleich steht der Fehler ab ~250 Schritten
+   bei ~0,108 (Zielvarianz ~0,39) und sinkt nicht weiter, in beiden Pfaden gleich. Die Regel
+   „jedes Gewicht mit Gradient ≠ 0 bewegt sich jeden Schritt um ±1 Code“ lässt die Gewichte um
+   ihr Optimum pendeln. Das ist kein Kernel-Thema, sondern eine Eigenschaft des Updates.
+   Kandidaten, je mit eigenem Vergleich: Update nur ab einer Schwelle |G| (Totzone),
+   Gradienten über mehrere Schritte ansammeln (Akkumulator pro Gewicht, kostet Speicher),
+   stochastisches Runden des Schritts. Der fusionierte Kernel kann jede dieser Regeln im
+   Epilog umsetzen.
 
 ---
 
@@ -422,6 +442,8 @@ Abweichungen vom Entwurf in Abschnitt 5, mit Grund:
   Fehlerfällen.
 - **Python:** `check_cuda_backend.py` gegen die Emulator-Bibliothek. Float-Pfade weichen um
   ~1e-7 von numpy ab, die Codes nach jedem STE-Schritt sind identisch, für alle drei Gitter.
+- **int8 im Training (numpy-Simulation des GPU-Pfads):** kein messbarer Unterschied zu float,
+  Details in 12.1.
 - **Nicht geprüft:** jede Laufzeit, der Tensor-Core-Pfad, echtes GPU-Speicherverhalten
   (Caches, Wettläufe zwischen Blöcken — der Emulator führt Blöcke nacheinander aus).
 
