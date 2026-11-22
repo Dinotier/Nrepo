@@ -61,7 +61,7 @@ Daraus folgen **zwei Regime**, die getrennte Kernels brauchen:
 | dX (Backward) | Thread pro Wort, atomicAdd über 64er-Zeilenstreifen | nicht deterministisch, viele Atomics | Reproduzierbarkeit fehlt |
 | STE-Update | Warp pro 4 Zeilen, Gradient per skalarer FMA | g = dYᵀX ist eine GEMM (rows×cols×batch), läuft aber ohne Kachelung, jedes X-Element nur 4× genutzt | weit unter FP32-Peak (Schätzung: < 10 %) |
 | Epiloge | Skala im Kernel, sonst nichts | Bias, Aktivierung, Residual extra | zusätzliche Speicherpässe |
-| act_bits | 2 Bit Aktivierung pro Gewicht | bricht die int8-Zerlegung, kostet Loads | Sonderweg in jedem Kernel |
+| act_bits | 2 Bit Aktivierung pro Gewicht | bricht die int8-Zerlegung, kostet Loads | Sonderweg in jedem Kernel → künftig nur float-GEMV (11.2) |
 | Tests | im Executable, Host-Referenz in double | gut, aber nur manuell auf GPU ausführbar | kein CI |
 
 **Was bleibt, weil es sich bewährt hat:**
@@ -154,7 +154,7 @@ Triplets packen. Neu:
 - Der **Epilog der vorherigen Schicht** schreibt direkt int8 + `sx` + `Σxq`.
 - Das Maximum pro Zeile braucht dafür eine Reduktion über alle CTAs der Zeile: Teilmaxima pro
   CTA, dann ein kleiner Abschluss-Kernel, oder dynamisch pro Kachel mit Kachelskala statt
-  Zeilenskala. **Entscheidung offen (11.4).**
+  Zeilenskala. **Offen, hängt an 12.1 und 12.2.**
 - Bei LayerNorm davor (EmojiNet) ist ein fester Bereich nach der Norm eine einfache Alternative.
 
 ### 5.4 Epilog-Fusion
@@ -235,7 +235,7 @@ fiver_status_t fiver_backward_step(fiver_ctx_t*, fiver_matrix_t*, const float* x
   Flags. **Der Controller muss nicht geändert werden.**
 - **Alternative:** eine PyTorch-Extension (`torch.autograd.Function`). Die Namen
   `pyTorch_nv/i86/risc` legen das nahe, der Python-Code nutzt PyTorch aber bisher nicht.
-  **Entscheidung offen (11.1).**
+  **Entschieden: ctypes (11.1).**
 
 ---
 
@@ -291,6 +291,8 @@ Modell ohne Umrechnung auf CPU oder FPGA laufen.
   - STE-Update exakt bis auf die heute schon gezählten „ambiguous“-Fälle mit |g| ≈ 0.
 - **Formen:** ungerade Spaltenzahlen (Padding), Batch-Reste, Zeilen < Kachel, cols > 65536
   (INT8-Grenze), leere Zeilen (Skala 0).
+- **Gitter:** jeder Pfad (GEMV, GEMM float/int8/MMA, dX, Update) × jedes Gitter (`centered`,
+  `anchored`, `magic`) ist ein eigener Testfall (Entscheidung 11.3).
 - **Werkzeuge:** `compute-sanitizer --tool memcheck|racecheck` in jeder Phase, Nsight Compute
   für die Roofline-Kennzahlen (`dram__throughput`, `sm__inst_executed_pipe_*`).
 - **CI:** Build-Job ohne GPU (Kompilieren für alle Archs, Python-Tests, `xcheck`). GPU-Tests
@@ -320,22 +322,35 @@ denn EmojiNet trainiert mit Batch 32 im GEMM-Regime, GEMV ist eher für LLM-Infe
 
 ---
 
-## 11. Offene Entscheidungen und Risiken
+## 11. Entscheidungen
 
-1. **Python-Anbindung:** `ctypes` (schlank, ohne Abhängigkeit) oder PyTorch-Extension (passt
-   zu den Namen `pyTorch_*`, bringt Autograd mit, aber eine große Abhängigkeit).
-   *Vorschlag:* ctypes für P1, PyTorch nur, wenn das Training ohnehin auf PyTorch umziehen soll.
-2. **act_bits (Aktivierung pro Gewicht):** kostet in jedem Kernel einen Sonderweg und bricht die
-   int8-Pfade. *Vorschlag:* in der neuen Bibliothek nur im float-GEMV unterstützen oder ganz
-   streichen. Bisher nutzt es kein Modell.
-3. **Gitter für EmojiNet:** `centered` ist ~5 % genauer, `magic` ist backend-übergreifend
-   bitgleich und in int8 und FP8 exakt. *Vorschlag:* `magic`, wenn i86/risc wirklich kommen.
-4. **int8-Aktivierungen im Training:** Ob das STE-Training mit quantisiertem x stabil bleibt,
-   ist ungeprüft. *Vorschlag:* in P3 beide Pfade (float, dp4a) am Loss-Verlauf vergleichen.
-5. **Zeilenskala vs. Blockskala:** Blockskalen (32–96 Gewichte) wären genauer (nicht gemessen)
-   und passen zur Kachelung mit K = 96. Sie ändern aber das Format. *Vorschlag:* nach P3 messen.
-6. **Treiber/Toolkit:** Die 1080 Ti braucht CUDA 12.x (CUDA 13 hat sm_61 entfernt). Laut
+| # | Thema | Entscheidung |
+|---|---|---|
+| 11.1 | Python-Anbindung | **ctypes** gegen die C-ABI aus Abschnitt 6. Keine PyTorch-Abhängigkeit. |
+| 11.2 | act_bits (Aktivierung pro Gewicht) | Nur im **float-GEMV**. Alle anderen Pfade (int8, GEMM, Backward) lehnen Matrizen mit act_bits ab. Hinweis: Wer mit act_bits *trainieren* will, braucht dazu auch ein float-dX, sonst passt der Gradient nicht zum Forward. Das kommt erst, wenn ein Modell es nutzt. |
+| 11.3 | Gitter | **Alle drei Gitter (`centered`, `anchored`, `magic`) werden in jedem Pfad getrennt aufgebaut und getestet.** Keine Variante wird zugunsten einer anderen eingespart. Die Testmatrix ist Pfad × Gitter (Abschnitt 9). Welches Gitter EmojiNet standardmäßig nutzt, ist damit eine reine Konfigurationsfrage. |
+| 11.4 | dX ohne Atomics *(Vorschlag, noch zu bestätigen)* | Gekachelter dX mit Reduktion in fester Reihenfolge (5.5) ist der Standard. Grund: Mit Atomics landen bei 4096 Zeilen und 64er-Streifen 64 Atomics auf jedem dX-Element, bei Batch 32 × 4096 Spalten ≈ 8,4 Mio. Diese werden im L2 serialisiert, wo sie dieselbe Adresse treffen. Geschätzt kostet das so viel wie die Rechnung selbst oder mehr, dazu kommt das Nullsetzen. Außerdem kippen nicht reproduzierbare Rundungen beim STE-Training Vorzeichen nahe 0, und Läufe mit gleichem Seed laufen auseinander. Der Atomics-Pfad bleibt nur als Messvergleich. |
+
+## 12. Offen und Risiken
+
+1. **int8-Aktivierungen im Training.** Im int8-Pfad wird neben den Gewichten auch x gerundet
+   (Skala pro Zeile max|x|/127, zusätzliches Rauschen bis ~0,4 % von max|x| je Element). Für
+   Inferenz ist das gut belegt. Ungeprüft ist, ob STE-Training von Grund auf damit genauso
+   konvergiert, denn die Schritte hängen am Vorzeichen des Gradienten, und der hängt an den
+   gerundeten Vorwärtswerten. Beim `magic`-Gitter sind die Gewichte in int8 exakt, dort rundet
+   nur x. *Test in P3:* EmojiNet mit gleichen Seeds einmal über den float-Pfad, einmal über
+   `__dp4a` trainieren und die Loss-Kurven vergleichen. Liegen sie dicht beieinander, darf das
+   Training den int8-Pfad nutzen. Sonst nutzt das Training float, und int8 bleibt für die Inferenz.
+2. **Zeilenskala vs. Blockskala:** bewusst offen. Blockskalen (32–96 Gewichte) wären vermutlich
+   genauer (nicht gemessen) und passen zur Kachelung mit K = 96, ändern aber das Format. Die
+   neue Bibliothek kapselt die Skala hinter dem Matrix-Handle, damit die Entscheidung später
+   ohne API-Bruch fallen kann.
+3. **Treiber/Toolkit:** Die 1080 Ti braucht CUDA 12.x (CUDA 13 hat sm_61 entfernt). Laut
    NVIDIA ist die Treiberreihe R580 die letzte mit Pascal-Unterstützung. Turing+-Pfade
    langfristig separat pflegen.
-7. **Kein GPU-Zugang in der Entwicklungsumgebung:** Jede Phase braucht einen Messlauf auf
+4. **Kein GPU-Zugang in der Entwicklungsumgebung:** Jede Phase braucht einen Messlauf auf
    echter Hardware, bevor die nächste beginnt. Das ist der größte Zeitfaktor.
+5. **Aufwand der Kachel-Kernels (P3/P4):** grob 600–1000 Zeilen CUDA. Korrektheit ist schnell
+   erreicht. Die Leistung (Kachelgrößen, Pipelining, Bank-Konflikte) braucht mehrere
+   Mess-Iterationen auf der Zielkarte. Die heutigen Kernels bleiben als Referenz und für kleine
+   Batches erhalten, der Umbau ist dadurch inkrementell.
