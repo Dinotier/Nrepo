@@ -370,3 +370,81 @@ denn EmojiNet trainiert mit Batch 32 im GEMM-Regime, GEMV ist eher für LLM-Infe
    erreicht. Die Leistung (Kachelgrößen, Pipelining, Bank-Konflikte) braucht mehrere
    Mess-Iterationen auf der Zielkarte. Die heutigen Kernels bleiben als Referenz und für kleine
    Batches erhalten, der Umbau ist dadurch inkrementell.
+
+---
+
+## 13. Umsetzungsstand
+
+### 13.1 Was gebaut ist
+
+| Phase | Stand | Anmerkung |
+|---|---|---|
+| P0 Struktur | **fertig** | `cuda/` mit `format.h`, `compat.h`, `cuda_emu.h`, Bibliothek `libfiver_cuda.so`, CLI `build/compact_weights_test` (Flags unverändert) |
+| P1 Anbindung | **fertig, nur im Emulator geprüft** | C-ABI (`fiver.h`), `emoji_net/fiver_cuda.py`, `FiverLayer(backend="cuda")`, `train.py --backend cuda` mit numpy-Rückfall |
+| P2 GEMV v2 | **fertig, nicht gemessen** | siehe 13.2 |
+| P3 GEMM sm_61 | **fertig, nicht gemessen** | FP32-SIMT und `__dp4a`, Split-K deterministisch |
+| P4 Backward v2 | **fertig, nicht gemessen** | dX gekachelt ohne Atomics, wgrad + STE fusioniert |
+| P5–P7 | offen | Epiloge über Bias hinaus, CUDA Graphs, Turing+-MMA, FP8 |
+
+### 13.2 Tatsächliche Kernel-Auslegung (sm_61, `nvcc -Xptxas -v`)
+
+| Kernel | Kachel | Threads | Register | Shared | CTAs/SM (Reg. / Shared) |
+|---|---|---|---|---|---|
+| `k_gemv_v2<4,4>` (Batch ≤ 4) | 16 Zeilen, x-Block 768 Spalten | 128 | 72 | 12,4 KB | 7 / 7 |
+| `k_gemv_v2<2,8>` (Batch 5–8) | 8 Zeilen | 128 | 91 | 24,8 KB | 5 / 3 |
+| `k_gemm_f32` | 128 Zeilen × 32 Batch × 48 Spalten | 128 | 94 | 30,0 KB | 5 / 3 |
+| `k_gemm_dp4a` | 128 × 32 × 48 (12 int32-Gruppen) | 128 | 80 | 7,5 KB | 6 / 12 |
+| `k_dgrad` | 192 Spalten × 32 Batch, Zeilen in 32er-Blöcken | 128 | 115 | 28,8 KB | 4 / 3 |
+| `k_wgrad_ste` | 64 Zeilen × 96 Spalten, Batch in 32er-Blöcken | 128 | 104 | 20,0 KB | 4 / 4 |
+
+Abweichungen vom Entwurf in Abschnitt 5, mit Grund:
+- **GEMM-Kachel 128 × 32 × 48 statt 128 × 64 × 96:** Eine entpackte 96er-Kachel braucht 48 KB
+  und sprengt die 48-KB-Grenze pro Block. N = 32 passt zur EmojiNet-Batch. Damit sich die
+  B-Werte als Warp-Broadcast lesen lassen, teilt sich jeder Warp dieselben 8 Batch-Spalten. Pro
+  k ergeben sich ~6 Shared-Memory-Wavefronts gegen 8 FMA-Takte, ausgelegt auf FMA-Grenze.
+- **GEMV v2 mit Wort-Verschränkung statt `uint4`-Loads:** Lane l liest Wort l + 32j. Die
+  Gewichts-Loads bleiben 128-Byte-zusammenhängend, und die x-Werte in Shared Memory
+  (wortweise transponiert) liest jede Lane ohne Bank-Konflikt. Mit `uint4` pro Lane wären die
+  x-Reads 4–8-fach konfliktbehaftet. Den Load-Engpass aus Abschnitt 3 löst die Wiederverwendung
+  von x über RPW Zeilen pro Warp (Lade-Einheit grob 1,3 statt 2 Befehle pro Gewicht).
+- **Zeilenbreite auf 16 Wörter (96 Spalten) gepolstert** (`fiver_row_pitch`): Keine Kachel
+  überschreitet ein Zeilenende, die Schleifen kommen ohne Randprüfung aus. Das externe Format
+  (Python, GGUF) bleibt unverändert, die Bibliothek polstert beim Hochladen.
+- **Tensor-Core-Pfad** (`k_gemm_tc`): nur auf ausdrückliche Anfrage (`FIVER_PATH_INT8_TC`).
+  Im Automatikbetrieb werden ausschließlich Pfade genutzt, die der Emulator geprüft hat.
+- **Stellschrauben für die erste GPU-Messung:** `__launch_bounds__` für `k_dgrad` und
+  `k_gemm_f32` (Belegung 3 CTAs/SM), Split-K-Ziel (heute 2 × SMs), RPW/BT im GEMV v2.
+
+### 13.3 Was geprüft ist und was nicht
+
+- **CPU-Emulator:** 237 Prüfungen grün. Alle Pfade × alle Gitter, ungerade Formen,
+  Batch-Reste, erzwungene Splits, bitgleiche Wiederholung, STE-Codes einzeln, C-ABI mit
+  Fehlerfällen.
+- **Python:** `check_cuda_backend.py` gegen die Emulator-Bibliothek. Float-Pfade weichen um
+  ~1e-7 von numpy ab, die Codes nach jedem STE-Schritt sind identisch, für alle drei Gitter.
+- **Nicht geprüft:** jede Laufzeit, der Tensor-Core-Pfad, echtes GPU-Speicherverhalten
+  (Caches, Wettläufe zwischen Blöcken — der Emulator führt Blöcke nacheinander aus).
+
+**Befund int8 + `anchored`:** Die int8-Rundung von x erzeugt einen absoluten Fehler, der mit der
+Gewichtsgröße wächst. Beim `anchored`-Gitter liegen alle Gewichte bei etwa 1 (Skala 1), die
+Vorwärtswerte sind Summen großer Beiträge bis ±26. Ausgänge nahe 0 tragen deshalb einen großen
+relativen Fehler, den Softsign fast ungedämpft weitergibt. Im Testnetz sind das 8 % nach der
+Aktivierung, bei `centered` und `magic` 1–2 %. **Für das Training mit int8-Aktivierungen
+eignen sich nur die nullzentrierten Gitter.**
+
+### 13.4 Auf der GTX 1080 Ti ausführen
+
+```
+cmake -S . -B build && cmake --build build -j
+./build/compact_weights_test --test                  # muss "TEST PASSED" zeigen
+./build/compact_weights_test --bench-gemv --bench-gemm --bench-bwd
+python3 emoji_net/check_cuda_backend.py              # Python-Anbindung gegen die GPU
+python3 emoji_net/train.py --backend cuda --epochs 1 # erstes GPU-Training
+```
+
+Ohne GPU, für Tests auf jedem Rechner:
+
+```
+cmake -S . -B build-emu -DFIVER_EMU=ON && cmake --build build-emu -j
+./build-emu/compact_weights_test --test
+```
