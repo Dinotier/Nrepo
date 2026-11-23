@@ -172,6 +172,14 @@ inline float    __fsqrt_rn(float x)          { return std::sqrt(x); }
 inline float    __frsqrt_rn(float x)         { return 1.0f / std::sqrt(x); }
 inline float    __fdividef(float a, float b) { return a / b; }
 
+/* PRMT: result byte n = byte (s >> 4n) & 7 of the 8 bytes {y:x} (x = bytes 0-3). */
+inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s) {
+    const unsigned long long v = ((unsigned long long)y << 32) | x;
+    unsigned r = 0;
+    for (int n = 0; n < 4; n++) r |= (unsigned)((v >> (8 * ((s >> (4 * n)) & 7u))) & 0xFFu) << (8 * n);
+    return r;
+}
+
 inline int __dp4a(int a, int b, int c) {
     for (int i = 0; i < 4; i++) c += (int)(int8_t)(a >> (8 * i)) * (int)(int8_t)(b >> (8 * i));
     return c;

@@ -321,6 +321,26 @@ nachschlägt: ein Warp-Shuffle über 32 Lanes (GPU), `vpermt2ps` über 2 × 16 f
   (nicht gemessen).
 - 6 Codes à 5 Bit füllen ein 32-Bit-Wort bis auf 2 Bit (6 % Verschnitt).
 - Messprogramm: `bench/cpu_lut_width.c`.
+**int8-Tabellen: `vpermb` / `vpermi2b` (CPU) und Shuffle + `PRMT` (GPU)** — gemessen bzw. gezählt:
+
+| Tabelle | AVX-512-VBMI, Granite Rapids | GPU sm_61, Shuffles pro Code |
+|---|---|---|
+| 6 Bit (64 int8) | `vpermb` 0,0086 ns/Code (116 G/s) | 1 |
+| 7 Bit (128 int8) | `vpermi2b` 0,0115 ns/Code (87 G/s) | 1 (Lane hält 4 Bytes) |
+| 8 Bit (256 int8) | 2 × `vpermi2b` + Blend 0,0202 ns/Code | 2 |
+| Fiver 5 Bit aus gepackten Wörtern → int8 | `vpmovzxdq` + `vpmultishiftqb` + `vpermi2b`: 0,0227 ns/Code (44 G/s) | 1 |
+
+- Für int8-Werte liegt die Ein-Befehl-Grenze bei 7 Bit statt 5.
+- `vpmultishiftqb` zieht die 6 Codes eines Worts in einem Befehl an ihre Byte-Positionen. Die
+  32er-Tabelle steht viermal wiederholt in den 128 Bytes von `vpermi2b`, damit stören die
+  mitgezogenen Nachbarbits nicht: 3 Befehle für 48 Codes.
+- GPU: nvcc erzeugt `PRMT` für Byte-Packen schon selbst. Explizites `__byte_perm` spart bei 7/8 Bit
+  ~8 % Befehle (44 statt 48, 63 statt 68), bei 5 Bit kostet es mehr (55 statt 42), weil die
+  Selektoren zur Laufzeit entstehen. Der `__dp4a`-Kernel bleibt bei Shift/Or.
+- Option, keine Empfehlung: Ein int8-Gitter mit 6 oder 7 Bit wäre gleich billig zu entpacken, kostet
+  aber 6,4 bzw. 8 Bit pro Gewicht (5 bzw. 4 Codes pro Wort).
+- Programme: `bench/cpu_int8_lut.c` (CPU, mit Korrektheitsprüfung), `cuda/bench/prmt_lut.cu`
+  (`build/prmt_lut_test`, Korrektheit auf GPU oder im Emulator).
 ---
 
 ## 9. Test- und Messstrategie
