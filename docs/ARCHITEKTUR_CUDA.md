@@ -341,6 +341,21 @@ nachschlägt: ein Warp-Shuffle über 32 Lanes (GPU), `vpermt2ps` über 2 × 16 f
   aber 6,4 bzw. 8 Bit pro Gewicht (5 bzw. 4 Codes pro Wort).
 - Programme: `bench/cpu_int8_lut.c` (CPU, mit Korrektheitsprüfung), `cuda/bench/prmt_lut.cu`
   (`build/prmt_lut_test`, Korrektheit auf GPU oder im Emulator).
+**fp16-Tabellen für den float-Pfad: `vpermw` / `vpermi2w` + `vcvtph2ps`** (AVX512BW, ohne VBMI;
+Codes als 16-Bit-Lanes, Granite Rapids, ns/Code):
+
+| Breite | float32-Tabelle | fp16-Tabelle |
+|---|---|---|
+| 5 Bit | **0,0351** (`vpermt2ps`) | 0,0416 (`vpermw` + 2 × `vcvtph2ps`) |
+| 6 Bit | 0,0706 (2 × `vpermt2ps` + Blend) | **0,0494** (`vpermi2w` + 2 × `vcvtph2ps`) |
+| 7 Bit | — | 0,0721 (2 × `vpermi2w` + Blend + Umwandlung) |
+
+- 5 Bit bleibt bei float32. Für 6 Bit im float-Pfad ist fp16 30 % billiger, 7 Bit gehört in den
+  int8-Pfad (`vpermi2b`).
+- `magic` kommt über fp16 bitgenau an, `centered` rundet um höchstens 2,1e-4 relativ.
+- GPU-Gegenstück (nicht getestet): zwei fp16 pro Lane, also 64 Einträge pro Shuffle, danach eine
+  Umwandlung.
+- Programm: `bench/cpu_fp16_lut.c` (mit Korrektheits- und Exaktheitsprüfung).
 ---
 
 ## 9. Test- und Messstrategie
