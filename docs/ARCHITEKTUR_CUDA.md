@@ -257,6 +257,23 @@ Emerald-Rapids-Xeon (Cloud-VM, 1 Kern, Takt unbekannt, Läufe schwanken um ±20 
 | AVX-512 LUT per Gather | 22 / 48 Gew. | 0,56 – 0,65 (Zen 0,19) | 0,20 / 0,22 |
 | AVX-512 magic per Formel | 43 / 48 Gew. | 0,44 – 0,45 | 0,16 / 0,17 |
 
+**Zweite Messung, Granite Rapids** (Xeon 6, Cloud-VM, 1 Kern gebunden, 7 Durchläufe, Median
+und Streuung max−min, ns pro Gewicht):
+
+| Variante | 0,8 MB (L2) | Streuung | 25 MB (L3/RAM) | Streuung |
+|---|---|---|---|---|
+| AVX2 LUT per Permute | 0,226 | 4 % | 0,444 | 12 % |
+| AVX2 LUT per Gather | 0,169 | 6 % | 0,377 | 20 % |
+| AVX2 magic per Formel | 0,174 | 10 % | 0,412 | 20 % |
+| AVX-512 LUT `vpermt2ps` | **0,038** | 34 % (1 Ausreißer) | **0,055** | 20 % |
+| AVX-512 LUT per Gather | 0,152 | 20 % | 0,337 | 60 % |
+| AVX-512 magic per Formel | 0,130 | 3 % | 0,400 | 28 % |
+
+Gleiche Rangfolge wie auf Emerald Rapids: AVX2 Formel vor Permute-Tabelle (−23 % im L2-Fall),
+AVX-512 Tabelle 3,4–7× vor der Formel. Gather ist auf beiden neuen Xeons schnell, auf älteren
+Kernen (bis Ice Lake, Downfall-Mitigation) und auf AMD nicht. Die 25-MB-Werte streuen stark,
+vermutlich durch L3/RAM, den sich die VM mit anderen teilt.
+
 - **AVX2:** Die Formel braucht *mehr* Befehle als die Tabelle, ist aber schneller. Die
   32er-Tabelle braucht 15 Shuffles pro Block, und die laufen auf Intel alle über Port 5. Die
   Formel verteilt sich auf die normalen ALUs. **→ AVX2-Backend entpackt `magic` per Formel.**
