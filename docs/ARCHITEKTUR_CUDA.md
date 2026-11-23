@@ -302,13 +302,13 @@ Modell ohne Umrechnung auf CPU oder FPGA laufen.
 ### 8.3 Warum 5 Bit: die Kosten des Entpackens nach Codebreite
 
 32 Einträge sind auf beiden Plattformen die größte Tabelle, die **ein** Befehl aus Registern
-nachschlägt: ein Warp-Shuffle über 32 Lanes (GPU),  über 2 × 16 floats (AVX-512).
+nachschlägt: ein Warp-Shuffle über 32 Lanes (GPU), `vpermt2ps` über 2 × 16 floats (AVX-512).
 
 | Codebreite | AVX-512 gemessen, ns/Code (Granite Rapids) | GPU sm_61, Befehle für 8 Codes (SASS) |
 |---|---|---|
-| 4 Bit | 0,027 (1 × ) | 46 (8 Shuffles) |
-| **5 Bit** | **0,027** (1 × ) | **46** (8 Shuffles) |
-| 6 Bit | 0,053 (2 ×  + Blend) | 76 (16 Shuffles + Auswahl) |
+| 4 Bit | 0,027 (1 × `vpermps`) | 46 (8 Shuffles) |
+| **5 Bit** | **0,027** (1 × `vpermt2ps`) | **46** (8 Shuffles) |
+| 6 Bit | 0,053 (2 × `vpermt2ps` + Blend) | 76 (16 Shuffles + Auswahl) |
 | 8 Bit | 0,151 (Gather) | 64 (Shared Memory, plus Bank-Konflikte, Füllschleife, Barriere) |
 | int5 gleichmäßig, ohne Tabelle | 0,035 | 52 |
 
@@ -316,11 +316,11 @@ nachschlägt: ein Warp-Shuffle über 32 Lanes (GPU),  über 2 × 16 floats (AVX-
   Ab 6 Bit verdoppelt sich der Aufwand auf beiden Plattformen.
 - Die Tabelle macht ein frei geformtes Gitter (Fiver) so billig wie ein gleichmäßiges
   int-Gitter, nicht billiger.
-- Die Grenze gilt für float-Tabellen. Hält die Tabelle int8-Werte (-Pfad), reichen
-   (AVX-512-VBMI, 128 Bytes) bzw. Shuffle +  (GPU, 4 Bytes pro Lane) bis 7 Bit
+- Die Grenze gilt für float-Tabellen. Hält die Tabelle int8-Werte (`__dp4a`-Pfad), reichen
+  `vpermi2b` (AVX-512-VBMI, 128 Bytes) bzw. Shuffle + `PRMT` (GPU, 4 Bytes pro Lane) bis 7 Bit
   (nicht gemessen).
 - 6 Codes à 5 Bit füllen ein 32-Bit-Wort bis auf 2 Bit (6 % Verschnitt).
-- Messprogramm: .
+- Messprogramm: `bench/cpu_lut_width.c`.
 ---
 
 ## 9. Test- und Messstrategie
