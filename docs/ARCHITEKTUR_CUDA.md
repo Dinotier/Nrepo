@@ -356,6 +356,22 @@ Codes als 16-Bit-Lanes, Granite Rapids, ns/Code):
 - GPU-Gegenstück (nicht getestet): zwei fp16 pro Lane, also 64 Einträge pro Shuffle, danach eine
   Umwandlung.
 - Programm: `bench/cpu_fp16_lut.c` (mit Korrektheits- und Exaktheitsprüfung).
+**Direkt in fp16 weiterrechnen** (AVX512-FP16 / -BF16, Skalarprodukt über 4608 Gewichte, 5-Bit
+`magic`, L2-resident, Median aus 9 Läufen, Streuung < 5 %):
+
+| Variante | ns/Gewicht | vs. fp32 | Fehler (rel. zu Σ\|w·x\|) |
+|---|---|---|---|
+| fp32: `vpermt2ps` + `vfmadd231ps` | 0,0388 | 1,00× | 9e-9 |
+| **fp16: `vpermw` + `vfmadd231ph`** | **0,0208** | **1,87×** | 5,9e-5 |
+| fp16, alle 8 FMAs in fp32-Summe | 0,0236 | 1,64× | 2,5e-5 |
+| bf16: `vpermw` + `vdpbf16ps` | 0,0326 | 1,19× | 6,5e-5 |
+
+- `vpermw` liefert 32 fp16-Werte, `vfmadd231ph` rechnet 32 FMAs: gleiche Breite, keine Umwandlung.
+- Der Fehler (Rundung von x auf fp16 und fp16-Summe) liegt weit unter dem Quantisierungsfehler der
+  5-Bit-Gewichte (~6 %). Für Inferenz unkritisch, für Training (dX, Gewichts-Gradient) fp32 behalten.
+- GPU-Gegenstück: `half2` pro Lane (64 Einträge pro Shuffle) + `HFMA2`. Auf der 1080 Ti nutzlos
+  (fp16 mit 1/64 der FP32-Rate), ab Turing doppelt so schnell wie FP32. Nicht getestet.
+- Programm: `bench/cpu_fp16_compute.c`.
 ---
 
 ## 9. Test- und Messstrategie
